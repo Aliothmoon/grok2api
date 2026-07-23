@@ -29,6 +29,19 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
 	return fn(request)
 }
 
+func TestAdapterHotUpdatesDirectResponseHeaderTimeout(t *testing.T) {
+	adapter := NewAdapter(Config{ResponseHeaderTimeout: 2 * time.Minute}, nil)
+	before := adapter.base.current.Load()
+	if before.ResponseHeaderTimeout != 2*time.Minute {
+		t.Fatalf("initial timeout = %s", before.ResponseHeaderTimeout)
+	}
+	adapter.UpdateConfig(Config{ResponseHeaderTimeout: 7 * time.Minute})
+	after := adapter.base.current.Load()
+	if after == before || after.ResponseHeaderTimeout != 7*time.Minute {
+		t.Fatalf("updated transport=%p timeout=%s", after, after.ResponseHeaderTimeout)
+	}
+}
+
 func TestCredentialMetadataMarksOnlyNumericBotFlagOne(t *testing.T) {
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	if err != nil {
@@ -782,6 +795,7 @@ func TestForwardResponsePreservesClaudeCodeMessagesOptions(t *testing.T) {
 		Body: []byte(`{
 			"model":"public","max_tokens":256,"stop_sequences":["STOP"],
 			"thinking":{"type":"enabled","budget_tokens":20000},
+			"output_config":{"effort":"max"},
 			"messages":[{"role":"system","content":"legacy system"},{"role":"user","content":"hello"}]
 		}`),
 	})

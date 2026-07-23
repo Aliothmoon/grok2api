@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, ClipboardPaste, Compass, Download, ExternalLink, FileUp, Link, MoreHorizontal, Pencil, Plus, RefreshCw, RotateCw, Search, SquareTerminal, Trash2, TriangleAlert, Webhook } from "lucide-react";
+import { ArrowRight, ClipboardPaste, Compass, Download, ExternalLink, FileUp, Link, MoreHorizontal, Pencil, Plus, RefreshCw, RotateCw, Search, SquareTerminal, Trash2, TriangleAlert, Unlink, Webhook } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -16,6 +16,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -80,6 +81,7 @@ import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/accoun
 import { AccountNameCell } from "@/features/accounts/account-name-cell";
 import { WebAccountScriptsDialog } from "@/features/accounts/web-account-scripts";
 import { WebAccountSettingsDialogs, WebAccountSettingsMenu, type WebAccountConfirmationTarget } from "@/features/accounts/web-account-settings";
+import { assignEgressAccounts, listEgressNodes, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
 
 function isAbortError(error: unknown): boolean {
   return (error instanceof DOMException || error instanceof Error) && error.name === "AbortError";
@@ -115,11 +117,16 @@ export function AccountsPage() {
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [egressFilter, setEgressFilter] = useState("");
   const [renewalFilter, setRenewalFilter] = useState("");
   const [riskFilter, setRiskFilter] = useState("");
+  const [agreementFilter, setAgreementFilter] = useState("");
+  const [associationFilter, setAssociationFilter] = useState("");
   const [sort, setSort] = useState<TableSort>({ field: "createdAt", order: "desc" });
   const [selection, setSelection] = useState<AccountSelection>(() => ({ provider: "grok_build", ids: new Set() }));
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
+  const [egressBindingOpen, setEgressBindingOpen] = useState(false);
+  const [egressNodeID, setEgressNodeID] = useState("");
   const [cleanupOpen, setCleanupOpen] = useState(false);
   const [cleanupStatuses, setCleanupStatuses] = useState<Set<AccountCleanupStatus>>(() => new Set());
   const [exportOpen, setExportOpen] = useState(false);
@@ -180,13 +187,25 @@ export function AccountsPage() {
   const selected = selection.provider === provider ? selection.ids : new Set<string>();
 
   const accountsQuery = useQuery({
-    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, renewalFilter, riskFilter, sort.field, sort.order],
-    queryFn: () => listAccounts({ provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter, renewal: provider === "grok_build" ? renewalFilter : undefined, risk: provider === "grok_build" ? riskFilter : undefined, sortBy: sort.field, sortOrder: sort.order }),
+    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
+    queryFn: () => listAccounts({
+      provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter, egress: egressFilter,
+      renewal: provider === "grok_build" ? renewalFilter : undefined,
+      risk: provider === "grok_build" ? riskFilter : undefined,
+      agreement: provider === "grok_web" ? agreementFilter : undefined,
+      association: provider === "grok_web" ? associationFilter : undefined,
+      sortBy: sort.field, sortOrder: sort.order,
+    }),
   });
 
   const summaryQuery = useQuery({
     queryKey: ["accounts", "summary"],
     queryFn: getAccountSummary,
+  });
+  const egressNodesQuery = useQuery({
+    queryKey: ["egress-nodes", "account-binding"],
+    queryFn: () => listEgressNodes(),
+    enabled: egressBindingOpen,
   });
 
   const invalidateAccountData = useCallback(() => {
@@ -469,6 +488,31 @@ export function AccountsPage() {
     onError: showError,
   });
 
+  const bindEgressMutation = useMutation({
+    mutationFn: () => {
+      if (!egressNodeID) throw new Error(t("accounts.bindEgressEmpty"));
+      return assignEgressAccounts(egressNodeID, provider, [...selected]);
+    },
+    onSuccess: () => {
+      clearSelection();
+      setEgressBindingOpen(false);
+      invalidateAccountData();
+      void queryClient.invalidateQueries({ queryKey: ["egress-nodes"] });
+      toast.success(t("accounts.egressBound"));
+    },
+    onError: showError,
+  });
+  const unbindEgressMutation = useMutation({
+    mutationFn: () => unassignEgressAccounts(provider, [...selected]),
+    onSuccess: () => {
+      clearSelection();
+      invalidateAccountData();
+      void queryClient.invalidateQueries({ queryKey: ["egress-nodes"] });
+      toast.success(t("accounts.egressUnbound"));
+    },
+    onError: showError,
+  });
+
   const cleanupMutation = useMutation({
     mutationFn: () => cleanupAccounts(provider, [...cleanupStatuses]),
     onSuccess: (result) => {
@@ -529,6 +573,8 @@ export function AccountsPage() {
     setStatusFilter("");
     setRenewalFilter("");
     setRiskFilter("");
+    setAgreementFilter("");
+    setAssociationFilter("");
     setQuickImportOpen(false);
     setQuickImportTokens("");
   }
@@ -675,6 +721,7 @@ export function AccountsPage() {
   const summaryUnavailable = summaryQuery.isError;
   const providerAccountTotal = provider === "grok_build" ? buildSummary.total : provider === "grok_web" ? webSummary.total : consoleSummary.total;
   const hasProviderAccounts = providerAccountTotal > 0 || (result?.total ?? 0) > 0;
+  const bindableEgressNodes = (egressNodesQuery.data?.items ?? []).filter((node) => node.enabled && node.proxyConfigured && scopeSupportsAccountProvider(node.scope, provider));
   const bulkTaskPending = quotaSyncMutation.isPending
     || allTokenMutation.isPending
     || conversionMutation.isPending
@@ -684,6 +731,8 @@ export function AccountsPage() {
     || batchBillingMutation.isPending
     || batchTokenMutation.isPending
     || batchDeleteMutation.isPending
+    || bindEgressMutation.isPending
+    || unbindEgressMutation.isPending
     || cleanupMutation.isPending
     || webConfirmationMutation.isPending
     || webAccountScriptsMutation.isPending;
@@ -749,7 +798,7 @@ export function AccountsPage() {
           ref={fileInputRef}
           type="file"
           multiple
-          accept={provider === "grok_build" ? "application/json,.json" : "application/json,text/plain,.json,.txt"}
+          accept="application/json,text/plain,.json,.txt"
           className="hidden"
           onChange={(event) => {
             const files = Array.from(event.target.files ?? []);
@@ -787,6 +836,10 @@ export function AccountsPage() {
                   { value: "waitingReset", label: t("accounts.waitingReset") },
                   { value: "probing", label: t("accounts.probing") },
                 ] },
+                { id: "egress", label: t("accounts.egressFilter"), value: egressFilter, onChange: (value) => { setEgressFilter(value); setPage(1); }, options: [
+                  { value: "bound", label: t("accounts.egressBound") },
+                  { value: "unbound", label: t("accounts.egressUnbound") },
+                ] },
                 ...(provider === "grok_build" ? [{ id: "renewal", label: t("accountCredential.label"), value: renewalFilter, onChange: (value: string) => { setRenewalFilter(value); setPage(1); }, options: [
                   { value: "refreshable", label: t("accountCredential.autoRefresh") },
                   { value: "unrefreshable", label: t("accountCredential.noAutoRefresh") },
@@ -795,6 +848,22 @@ export function AccountsPage() {
                   { value: "flagged", label: t("accounts.botRisk") },
                   { value: "normal", label: t("accounts.riskNormal") },
                 ] }] : []),
+                ...(provider === "grok_web" ? [{ id: "agreement", label: t("accounts.agreementFilter"), value: agreementFilter, onChange: (value: string) => { setAgreementFilter(value); setPage(1); }, options: [
+                  { value: "nsfwEnabled", label: t("accounts.agreementNsfwEnabled") },
+                  { value: "nsfwDisabled", label: t("accounts.agreementNsfwDisabled") },
+                  { value: "termsAccepted", label: t("accounts.agreementTermsAccepted") },
+                  { value: "termsNotAccepted", label: t("accounts.agreementTermsNotAccepted") },
+                  { value: "allAccepted", label: t("accounts.agreementAllAccepted") },
+                  { value: "allNotAccepted", label: t("accounts.agreementAllNotAccepted") },
+                ] }] : []),
+                ...(provider === "grok_web" ? [{ id: "association", label: t("accounts.associationFilter"), value: associationFilter, onChange: (value: string) => { setAssociationFilter(value); setPage(1); }, options: [
+                  { value: "buildLinked", label: t("accounts.associationBuildLinked") },
+                  { value: "buildUnlinked", label: t("accounts.associationBuildUnlinked") },
+                  { value: "consoleLinked", label: t("accounts.associationConsoleLinked") },
+                  { value: "consoleUnlinked", label: t("accounts.associationConsoleUnlinked") },
+                  { value: "allLinked", label: t("accounts.associationAllLinked") },
+                  { value: "allUnlinked", label: t("accounts.associationAllUnlinked") },
+                ] }] : []),
               ]} />
             </div>
             {selected.size > 0 ? (
@@ -802,6 +871,8 @@ export function AccountsPage() {
                 <span className="mr-1 text-xs text-muted-foreground">{t("common.selectedCount", { count: selected.size })}</span>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(true)}>{t("common.enable")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(false)}>{t("common.disable")}</Button>
+                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => { setEgressNodeID(""); setEgressBindingOpen(true); }}><Link />{t("accounts.bindEgress")}</Button>
+                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => unbindEgressMutation.mutate()}><Unlink />{t("accounts.unbindEgress")}</Button>
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion([...selected])}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets([...selected])}>{t("webAccountScripts.action")}</Button> : null}
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchBillingMutation.mutate()}>{t("accountCredential.quotaSyncAction")}</Button>
@@ -1136,6 +1207,42 @@ export function AccountsPage() {
         </AlertDialogContent>
       </AlertDialog>
 
+      <Dialog open={egressBindingOpen} onOpenChange={(open) => {
+        if (bindEgressMutation.isPending) return;
+        setEgressBindingOpen(open);
+        if (!open) setEgressNodeID("");
+      }}>
+        <DialogContent className="sm:max-w-[460px]">
+          <DialogHeader>
+            <DialogTitle>{t("accounts.bindEgressTitle", { count: selected.size })}</DialogTitle>
+            <DialogDescription>{t("accounts.bindEgressDescription")}</DialogDescription>
+          </DialogHeader>
+          {egressNodesQuery.isPending ? <div className="flex min-h-20 items-center justify-center"><Spinner /></div> : null}
+          {egressNodesQuery.isError ? <p className="text-sm text-destructive">{egressNodesQuery.error.message}</p> : null}
+          {!egressNodesQuery.isPending && !egressNodesQuery.isError ? (
+            bindableEgressNodes.length > 0 ? (
+              <div className="space-y-2">
+                <Label htmlFor="account-egress-node">{t("accounts.bindEgressNode")}</Label>
+                <Select value={egressNodeID} onValueChange={setEgressNodeID}>
+                  <SelectTrigger id="account-egress-node"><SelectValue placeholder={t("accounts.bindEgressEmpty")} /></SelectTrigger>
+                  <SelectContent>
+                    {bindableEgressNodes.map((node) => (
+                      <SelectItem key={node.id} value={node.id}>
+                        {node.name} ({node.assignedAccountCount}{node.accountCapacity > 0 ? ` / ${node.accountCapacity}` : ` / ${t("settings.egress.unlimited")}`})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : <p className="text-sm text-muted-foreground">{t("accounts.bindEgressNoNodes")}</p>
+          ) : null}
+          <DialogFooter>
+            <Button type="button" variant="secondary" size="sm" disabled={bindEgressMutation.isPending} onClick={() => setEgressBindingOpen(false)}>{t("common.cancel")}</Button>
+            <Button type="button" size="sm" disabled={!egressNodeID || bindEgressMutation.isPending} onClick={() => bindEgressMutation.mutate()}>{bindEgressMutation.isPending ? <Spinner /> : null}{t("accounts.bindEgress")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={cleanupOpen} onOpenChange={(open) => { if (!cleanupMutation.isPending) { setCleanupOpen(open); if (!open) setCleanupStatuses(new Set()); } }}>
         <DialogContent className="max-w-[420px]">
           <DialogHeader>
@@ -1179,6 +1286,12 @@ function downloadAccountExport(blob: Blob, provider: AccountProvider): void {
   anchor.download = `grok2api-${provider.replaceAll("_", "-")}-accounts-${new Date().toISOString().slice(0, 10)}.json`;
   anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function scopeSupportsAccountProvider(scope: EgressScope, provider: AccountProvider): boolean {
+  if (provider === "grok_build") return scope === "grok_build";
+  if (provider === "grok_web") return scope === "grok_web";
+  return scope === "grok_web" || scope === "grok_console";
 }
 
 function AccountMetricPanel({ icon, label, value, detail, loading, tone }: { icon: ReactNode; label: string; value: string; detail: string; loading: boolean; tone: string }) {

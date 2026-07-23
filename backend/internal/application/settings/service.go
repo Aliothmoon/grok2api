@@ -20,12 +20,13 @@ var (
 
 // ProviderBuildConfig 是管理接口使用的 Provider 可编辑输入。
 type ProviderBuildConfig struct {
-	BaseURL          string
-	FallbackBaseURL  string
-	ClientVersion    string
-	ClientIdentifier string
-	TokenAuth        string
-	UserAgent        string
+	BaseURL               string
+	FallbackBaseURL       string
+	ClientVersion         string
+	ClientIdentifier      string
+	TokenAuth             string
+	UserAgent             string
+	ResponseHeaderTimeout string
 }
 
 // ProviderBuildRecommendation 表示当前网关已完成兼容回归的 Grok Build 协议基线。
@@ -90,12 +91,20 @@ type FrontendConfig struct {
 
 // RoutingConfig 是管理接口使用的路由可编辑输入。
 type RoutingConfig struct {
-	StickyTTL       string
-	CooldownBase    string
-	CooldownMax     string
-	CapacityWait    string
-	MaxAttempts     int
-	PreferFreeBuild bool
+	StickyTTL                 string
+	CooldownBase              string
+	CooldownMax               string
+	CapacityWait              string
+	MaxAttempts               int
+	PreferFreeBuild           bool
+	SegmentedSelector         SegmentedSelectorConfig
+	SegmentedSelectorProvided bool
+}
+
+type SegmentedSelectorConfig struct {
+	Enabled       bool
+	MinCandidates int
+	WindowSize    int
 }
 
 // AuditConfig 是管理接口使用的审计可编辑输入。
@@ -103,6 +112,7 @@ type AuditConfig struct {
 	BufferSize    int
 	BatchSize     int
 	FlushInterval string
+	CommitDelayMS int
 }
 
 // ClientKeyDefaultsConfig 是管理接口使用的密钥默认限制输入。
@@ -113,10 +123,16 @@ type ClientKeyDefaultsConfig struct {
 
 // AccountsConfig 是管理接口使用的账号池维护策略输入。
 type AccountsConfig struct {
-	AutoCleanReauthEnabled   bool
-	AutoCleanReauthInterval  string
-	AutoCleanReauthMinAge    string
-	AutoCleanIncludeDisabled bool
+	MarkBuildForbiddenReauth  bool
+	BuildForbiddenReauthCodes []string
+	AutoCleanReauthEnabled    bool
+	AutoCleanReauthInterval   string
+	AutoCleanReauthMinAge     string
+	AutoCleanIncludeDisabled  bool
+	// MarkBuildForbiddenReauthProvided preserves the value when an older management client omits the field.
+	MarkBuildForbiddenReauthProvided bool
+	// BuildForbiddenReauthCodesProvided preserves the configured codes when an older management client omits the field.
+	BuildForbiddenReauthCodesProvided bool
 }
 
 // EditableConfig 聚合管理端允许修改的运行参数。
@@ -282,6 +298,10 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.ProviderBuild.FallbackBaseURL),
 		ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
 		TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
+		ResponseHeaderTimeout: config.Duration(value.ProviderBuild.ResponseHeaderTimeout),
+	}
+	if value.ProviderBuild.ResponseHeaderTimeout <= 0 {
+		base.Provider.Build.ResponseHeaderTimeout = config.Duration(settingsdomain.DefaultBuildResponseHeaderTimeout)
 	}
 	clearanceMode := strings.TrimSpace(value.ProviderWeb.ClearanceMode)
 	if clearanceMode == "" {
@@ -329,15 +349,33 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Media.CleanupThresholdPercent = value.Media.CleanupThresholdPercent
 	base.Media.CleanupInterval = config.Duration(value.Media.CleanupInterval)
 	base.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(value.Frontend.PublicAPIBaseURL)
+	segmentedEnabled := base.Routing.SegmentedSelectorEnabled
+	segmentedMinCandidates := base.Routing.SegmentedMinCandidates
+	segmentedWindowSize := base.Routing.SegmentedWindowSize
+	if value.Routing.SegmentedSelector != nil {
+		segmentedEnabled = value.Routing.SegmentedSelector.ActiveEnabled
+		segmentedMinCandidates = value.Routing.SegmentedSelector.MinCandidates
+		segmentedWindowSize = value.Routing.SegmentedSelector.WindowSize
+	}
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
-		PreferFreeBuild:        value.Routing.PreferFreeBuild,
-		ReasoningReplayEnabled: base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
+		PreferFreeBuild:          value.Routing.PreferFreeBuild,
+		SegmentedSelectorEnabled: segmentedEnabled,
+		SegmentedMinCandidates:   segmentedMinCandidates,
+		SegmentedWindowSize:      segmentedWindowSize,
+		ReasoningReplayEnabled:   base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
 		ReasoningReplayMaxEntries: base.Routing.ReasoningReplayMaxEntries,
+	}
+	commitDelay := base.Audit.CommitDelay.Value()
+	if value.Audit.CommitDelay > 0 {
+		commitDelay = value.Audit.CommitDelay
 	}
 	base.Audit = config.AuditConfig{
 		BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: config.Duration(value.Audit.FlushInterval),
+		CommitDelay: config.Duration(commitDelay),
+		LedgerMode:  base.Audit.LedgerMode, LedgerFailureThreshold: base.Audit.LedgerFailureThreshold,
+		LedgerUnhealthyGrace: base.Audit.LedgerUnhealthyGrace, LedgerQueueHighWatermarkPct: base.Audit.LedgerQueueHighWatermarkPct,
 	}
 	base.ClientKeyDefaults = config.ClientKeyDefaultsConfig{
 		RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
@@ -351,6 +389,10 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	}
 	base.Accounts.AutoCleanReauthEnabled = value.Accounts.AutoCleanReauthEnabled
 	base.Accounts.AutoCleanIncludeDisabled = value.Accounts.AutoCleanIncludeDisabled
+	base.Accounts.MarkBuildForbiddenReauth = value.Accounts.MarkBuildForbiddenReauth
+	if value.Accounts.BuildForbiddenReauthCodes != nil {
+		base.Accounts.BuildForbiddenReauthCodes = append([]string(nil), value.Accounts.BuildForbiddenReauthCodes...)
+	}
 	return base
 }
 
@@ -362,6 +404,7 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			BaseURL: value.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.Provider.Build.FallbackBaseURL),
 			ClientVersion: value.Provider.Build.ClientVersion, ClientIdentifier: value.Provider.Build.ClientIdentifier,
 			TokenAuth: value.Provider.Build.TokenAuth, UserAgent: value.Provider.Build.UserAgent,
+			ResponseHeaderTimeout: value.Provider.Build.ResponseHeaderTimeout.Value(),
 		},
 		ProviderWeb: settingsdomain.ProviderWebConfig{
 			BaseURL: value.Provider.Web.BaseURL, QuotaTimeout: value.Provider.Web.QuotaTimeout.Value(),
@@ -393,18 +436,24 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			StickyTTL: value.Routing.StickyTTL.Value(), CooldownBase: value.Routing.CooldownBase.Value(),
 			CooldownMax: value.Routing.CooldownMax.Value(), CapacityWait: value.Routing.CapacityWait.Value(), MaxAttempts: value.Routing.MaxAttempts,
 			PreferFreeBuild: value.Routing.PreferFreeBuild,
+			SegmentedSelector: &settingsdomain.SegmentedSelectorConfig{
+				ActiveEnabled: value.Routing.SegmentedSelectorEnabled,
+				MinCandidates: value.Routing.SegmentedMinCandidates, WindowSize: value.Routing.SegmentedWindowSize,
+			},
 		},
 		Audit: settingsdomain.AuditConfig{
-			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval.Value(),
+			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval.Value(), CommitDelay: value.Audit.CommitDelay.Value(),
 		},
 		ClientKeyDefaults: settingsdomain.ClientKeyDefaultsConfig{
 			RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
 		},
 		Accounts: settingsdomain.AccountsConfig{
-			AutoCleanReauthEnabled:   value.Accounts.AutoCleanReauthEnabled,
-			AutoCleanReauthInterval:  value.Accounts.AutoCleanReauthInterval.Value(),
-			AutoCleanReauthMinAge:    value.Accounts.AutoCleanReauthMinAge.Value(),
-			AutoCleanIncludeDisabled: value.Accounts.AutoCleanIncludeDisabled,
+			MarkBuildForbiddenReauth:  value.Accounts.MarkBuildForbiddenReauth,
+			BuildForbiddenReauthCodes: append([]string(nil), value.Accounts.BuildForbiddenReauthCodes...),
+			AutoCleanReauthEnabled:    value.Accounts.AutoCleanReauthEnabled,
+			AutoCleanReauthInterval:   value.Accounts.AutoCleanReauthInterval.Value(),
+			AutoCleanReauthMinAge:     value.Accounts.AutoCleanReauthMinAge.Value(),
+			AutoCleanIncludeDisabled:  value.Accounts.AutoCleanIncludeDisabled,
 		},
 	}
 }
@@ -428,6 +477,9 @@ func (s *Service) snapshotLocked() Snapshot {
 }
 
 func mergeEditable(current config.Config, input EditableConfig) (config.Config, error) {
+	if input.Audit.CommitDelayMS < 0 {
+		return config.Config{}, errors.New("audit.commitDelayMS 不能为负数")
+	}
 	next := current
 	next.Server.MaxConcurrentRequests = input.Server.MaxConcurrentRequests
 	next.Provider.Build.BaseURL = strings.TrimSpace(input.ProviderBuild.BaseURL)
@@ -465,11 +517,25 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(input.Frontend.PublicAPIBaseURL)
 	next.Routing.MaxAttempts = input.Routing.MaxAttempts
 	next.Routing.PreferFreeBuild = input.Routing.PreferFreeBuild
+	if input.Routing.SegmentedSelectorProvided {
+		next.Routing.SegmentedSelectorEnabled = input.Routing.SegmentedSelector.Enabled
+		next.Routing.SegmentedMinCandidates = input.Routing.SegmentedSelector.MinCandidates
+		next.Routing.SegmentedWindowSize = input.Routing.SegmentedSelector.WindowSize
+	}
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
+	if input.Audit.CommitDelayMS > 0 {
+		next.Audit.CommitDelay = config.Duration(time.Duration(input.Audit.CommitDelayMS) * time.Millisecond)
+	}
 	next.ClientKeyDefaults.RPMLimit = input.ClientKeyDefaults.RPMLimit
 	next.ClientKeyDefaults.MaxConcurrent = input.ClientKeyDefaults.MaxConcurrent
 	if input.AccountsProvided {
+		if input.Accounts.MarkBuildForbiddenReauthProvided {
+			next.Accounts.MarkBuildForbiddenReauth = input.Accounts.MarkBuildForbiddenReauth
+		}
+		if input.Accounts.BuildForbiddenReauthCodesProvided {
+			next.Accounts.BuildForbiddenReauthCodes = normalizeForbiddenCodes(input.Accounts.BuildForbiddenReauthCodes)
+		}
 		next.Accounts.AutoCleanReauthEnabled = input.Accounts.AutoCleanReauthEnabled
 		next.Accounts.AutoCleanIncludeDisabled = input.Accounts.AutoCleanIncludeDisabled
 	}
@@ -494,6 +560,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		{"providerConsole.chatTimeout", input.ProviderConsole.ChatTimeout, func(value config.Duration) { next.Provider.Console.ChatTimeout = value }},
 		{"media.cleanupInterval", input.Media.CleanupInterval, func(value config.Duration) { next.Media.CleanupInterval = value }},
 		{"batch.randomDelay", input.Batch.RandomDelay, func(value config.Duration) { next.Batch.RandomDelay = value }},
+	}
+	if strings.TrimSpace(input.ProviderBuild.ResponseHeaderTimeout) != "" {
+		durations = append(durations, durationInput{"providerBuild.responseHeaderTimeout", input.ProviderBuild.ResponseHeaderTimeout, func(value config.Duration) { next.Provider.Build.ResponseHeaderTimeout = value }})
 	}
 	if input.ProviderWeb.ClearanceProvided {
 		durations = append(durations,
@@ -527,6 +596,7 @@ func toEditable(cfg config.Config) EditableConfig {
 			BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 			ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
 			TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent,
+			ResponseHeaderTimeout: cfg.Provider.Build.ResponseHeaderTimeout.String(),
 		},
 		ProviderWeb: ProviderWebConfig{
 			BaseURL: cfg.Provider.Web.BaseURL, QuotaTimeout: cfg.Provider.Web.QuotaTimeout.String(),
@@ -558,17 +628,43 @@ func toEditable(cfg config.Config) EditableConfig {
 			StickyTTL: cfg.Routing.StickyTTL.String(), CooldownBase: cfg.Routing.CooldownBase.String(),
 			CooldownMax: cfg.Routing.CooldownMax.String(), CapacityWait: cfg.Routing.CapacityWait.String(), MaxAttempts: cfg.Routing.MaxAttempts,
 			PreferFreeBuild: cfg.Routing.PreferFreeBuild,
+			SegmentedSelector: SegmentedSelectorConfig{
+				Enabled: cfg.Routing.SegmentedSelectorEnabled, MinCandidates: cfg.Routing.SegmentedMinCandidates,
+				WindowSize: cfg.Routing.SegmentedWindowSize,
+			},
+			SegmentedSelectorProvided: true,
 		},
 		Audit: AuditConfig{
-			BufferSize: cfg.Audit.BufferSize, BatchSize: cfg.Audit.BatchSize, FlushInterval: cfg.Audit.FlushInterval.String(),
+			BufferSize: cfg.Audit.BufferSize, BatchSize: cfg.Audit.BatchSize, FlushInterval: cfg.Audit.FlushInterval.String(), CommitDelayMS: int(cfg.Audit.CommitDelay.Value() / time.Millisecond),
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: cfg.ClientKeyDefaults.RPMLimit, MaxConcurrent: cfg.ClientKeyDefaults.MaxConcurrent},
 		Accounts: AccountsConfig{
-			AutoCleanReauthEnabled:   cfg.Accounts.AutoCleanReauthEnabled,
-			AutoCleanReauthInterval:  cfg.Accounts.AutoCleanReauthInterval.String(),
-			AutoCleanReauthMinAge:    cfg.Accounts.AutoCleanReauthMinAge.String(),
-			AutoCleanIncludeDisabled: cfg.Accounts.AutoCleanIncludeDisabled,
+			MarkBuildForbiddenReauth:          cfg.Accounts.MarkBuildForbiddenReauth,
+			BuildForbiddenReauthCodes:         append([]string(nil), cfg.Accounts.BuildForbiddenReauthCodes...),
+			MarkBuildForbiddenReauthProvided:  true,
+			BuildForbiddenReauthCodesProvided: true,
+			AutoCleanReauthEnabled:            cfg.Accounts.AutoCleanReauthEnabled,
+			AutoCleanReauthInterval:           cfg.Accounts.AutoCleanReauthInterval.String(),
+			AutoCleanReauthMinAge:             cfg.Accounts.AutoCleanReauthMinAge.String(),
+			AutoCleanIncludeDisabled:          cfg.Accounts.AutoCleanIncludeDisabled,
 		},
 		AccountsProvided: true,
 	}
+}
+
+func normalizeForbiddenCodes(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		code := strings.ToLower(strings.TrimSpace(value))
+		if code == "" {
+			continue
+		}
+		if _, exists := seen[code]; exists {
+			continue
+		}
+		seen[code] = struct{}{}
+		result = append(result, code)
+	}
+	return result
 }

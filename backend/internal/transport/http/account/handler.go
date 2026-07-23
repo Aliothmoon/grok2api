@@ -277,6 +277,8 @@ type accountResponse struct {
 	BuildSuperEntitled         bool                    `json:"buildSuperEntitled"`
 	BuildRouteMode             string                  `json:"buildRouteMode"`
 	BuildBotFlagged            bool                    `json:"buildBotFlagged"`
+	EgressNodeID               uint64                  `json:"egressNodeId,omitempty,string"`
+	EgressAssignmentMode       string                  `json:"egressAssignmentMode,omitempty"`
 	ModelSyncFailed            bool                    `json:"modelSyncFailed,omitempty"`
 	Billing                    *billingResponse        `json:"billing,omitempty"`
 	Quota                      quotaResponse           `json:"quota"`
@@ -364,7 +366,11 @@ type quotaResponse struct {
 
 func (h *Handler) list(c *gin.Context) {
 	page, pageSize := pagination(c)
-	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), accountapp.ListFilter{Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"), Renewal: c.Query("renewal"), Risk: c.Query("risk"), Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))}})
+	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), accountapp.ListFilter{
+		Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"), Egress: c.Query("egress"),
+		Renewal: c.Query("renewal"), Risk: c.Query("risk"), Agreement: c.Query("agreement"), Association: c.Query("association"),
+		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
+	})
 	if errors.Is(err, accountapp.ErrInvalidFilter) {
 		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
 		return
@@ -843,11 +849,11 @@ func writeAccountEvent(c *gin.Context, event string, value any) error {
 }
 
 func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provider) {
-	fileDescription := "账号凭据 JSON"
+	fileDescription := "账号凭据 JSON 或逐行 JSON 文本"
 	if providerValue == accountdomain.ProviderWeb {
-		fileDescription = "Grok Web JSON 或 SSO 文本"
+		fileDescription = "Grok Web JSON、逐行 JSON 或 SSO 文本"
 	} else if providerValue == accountdomain.ProviderConsole {
-		fileDescription = "Grok Console JSON 或 SSO 文本"
+		fileDescription = "Grok Console JSON、逐行 JSON 或 SSO 文本"
 	}
 	documents, ok := readAccountImportDocuments(c, fileDescription)
 	if !ok {
@@ -1154,6 +1160,8 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		BuildSuperEntitled:         c.BuildSuperEntitled && c.Provider == accountdomain.ProviderBuild,
 		BuildRouteMode:             string(buildRouteMode),
 		BuildBotFlagged:            value.BuildBotFlagged && c.Provider == accountdomain.ProviderBuild,
+		EgressNodeID:               c.EgressNodeID,
+		EgressAssignmentMode:       string(c.EgressAssignmentMode),
 		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
 	}
 	for _, linked := range c.LinkedAccounts {

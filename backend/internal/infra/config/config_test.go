@@ -51,14 +51,29 @@ bootstrapAdmin:
 	if cfg.Routing.PreferFreeBuild {
 		t.Fatal("preferFreeBuild should retain its false default when omitted from YAML")
 	}
+	if cfg.Routing.SegmentedSelectorEnabled || cfg.Routing.SegmentedMinCandidates != 3000 || cfg.Routing.SegmentedWindowSize != 64 {
+		t.Fatalf("segmented selector defaults = %#v", cfg.Routing)
+	}
 	if cfg.Accounts.AutoCleanReauthEnabled || cfg.Accounts.AutoCleanIncludeDisabled {
 		t.Fatal("accounts auto-clean flags should default to false")
+	}
+	if cfg.Accounts.MarkBuildForbiddenReauth || len(cfg.Accounts.BuildForbiddenReauthCodes) != 1 || cfg.Accounts.BuildForbiddenReauthCodes[0] != "permission-denied" {
+		t.Fatalf("Build forbidden-account defaults = %#v", cfg.Accounts)
 	}
 	if cfg.Accounts.AutoCleanReauthInterval.Value() != 10*time.Minute || cfg.Accounts.AutoCleanReauthMinAge.Value() != time.Hour {
 		t.Fatalf("accounts auto-clean defaults = %#v", cfg.Accounts)
 	}
 	if !cfg.Routing.ReasoningReplayEnabled || cfg.Routing.ReasoningReplayTTL.Value() != time.Hour || cfg.Routing.ReasoningReplayMaxEntries != 10240 {
 		t.Fatalf("reasoning replay defaults = %#v", cfg.Routing)
+	}
+	if cfg.Audit.CommitDelay.Value() != 5*time.Millisecond {
+		t.Fatalf("audit commit delay = %s", cfg.Audit.CommitDelay.Value())
+	}
+	if cfg.Audit.LedgerMode != "enforce" || cfg.Audit.LedgerFailureThreshold != 1 {
+		t.Fatalf("audit ledger defaults = %#v", cfg.Audit)
+	}
+	if cfg.Provider.Build.ResponseHeaderTimeout.Value() != 5*time.Minute {
+		t.Fatalf("Build response header timeout = %s", cfg.Provider.Build.ResponseHeaderTimeout.Value())
 	}
 	expectedDatabasePath := filepath.Join(dir, "data", "backend.db")
 	if cfg.Database.SQLite.Path != expectedDatabasePath {
@@ -74,15 +89,25 @@ bootstrapAdmin:
 	}
 }
 
+func TestBuildResponseHeaderTimeoutIsRuntimeOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("provider:\n  build:\n    responseHeaderTimeout: 10m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("runtime-only Build response header timeout was accepted from YAML")
+	}
+}
+
 func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	build := defaultConfig().Provider.Build
-	if RecommendedBuildClientVersion != "0.2.106" {
+	if RecommendedBuildClientVersion != "0.2.110" {
 		t.Fatalf("recommended clientVersion = %q", RecommendedBuildClientVersion)
 	}
 	if build.ClientVersion != RecommendedBuildClientVersion {
 		t.Fatalf("clientVersion = %q", build.ClientVersion)
 	}
-	if RecommendedBuildUserAgent != "grok-shell/0.2.106 (linux; x86_64)" {
+	if RecommendedBuildUserAgent != "grok-shell/0.2.110 (linux; x86_64)" {
 		t.Fatalf("recommended userAgent = %q", RecommendedBuildUserAgent)
 	}
 	if build.UserAgent != RecommendedBuildUserAgent {
@@ -143,6 +168,21 @@ routing:
 	}
 }
 
+func TestValidateRejectsInvalidSegmentedSelectorConfig(t *testing.T) {
+	tests := []func(*RoutingConfig){
+		func(value *RoutingConfig) { value.SegmentedMinCandidates = 99 },
+		func(value *RoutingConfig) { value.SegmentedWindowSize = 257 },
+		func(value *RoutingConfig) { value.SegmentedWindowSize = value.SegmentedMinCandidates + 1 },
+	}
+	for index, mutate := range tests {
+		cfg := defaultConfig()
+		mutate(&cfg.Routing)
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("case %d accepted invalid segmented selector config", index)
+		}
+	}
+}
+
 func TestLoadRejectsMediaRuntimeSettingsInYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte(`secrets:
@@ -181,6 +221,9 @@ func TestValidateRejectsUnsafeRuntimeLimits(t *testing.T) {
 	tests := map[string]func(*Config){
 		"request body": func(cfg *Config) { cfg.Server.MaxBodyBytes = maxServerBodyBytes + 1 },
 		"audit buffer": func(cfg *Config) { cfg.Audit.BufferSize = maxAuditBufferSize + 1 },
+		"audit commit delay": func(cfg *Config) {
+			cfg.Audit.CommitDelay = Duration(maxAuditCommitDelay + time.Millisecond)
+		},
 		"client rpm":   func(cfg *Config) { cfg.ClientKeyDefaults.RPMLimit = clientkeydomain.MaxRPMLimit + 1 },
 		"image size":   func(cfg *Config) { cfg.Media.MaxImageBytes = 33 << 20 },
 		"media total":  func(cfg *Config) { cfg.Media.MaxTotalBytes = 1 },
@@ -287,6 +330,16 @@ func TestValidateInfrastructureDrivers(t *testing.T) {
 	postgresRedis.RuntimeStore.Driver = "redis"
 	if err := postgresRedis.Validate(); err != nil {
 		t.Fatalf("valid postgres + redis configuration rejected: %v", err)
+	}
+	postgresRedis.Deployment = DeploymentConfig{Replicas: 2, InstanceID: "replica-a", ClusterID: "cluster-a", SharedMedia: true}
+	if err := postgresRedis.Validate(); err != nil {
+		t.Fatalf("valid multi-replica configuration rejected: %v", err)
+	}
+
+	invalidMultiReplica := base
+	invalidMultiReplica.Deployment.Replicas = 2
+	if err := invalidMultiReplica.Validate(); err == nil {
+		t.Fatal("multi-replica SQLite and memory configuration was accepted")
 	}
 
 	invalidDatabase := base

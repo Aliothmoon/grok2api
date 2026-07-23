@@ -403,6 +403,31 @@ func TestConvertAnthropicClaudeCodeRequestToResponses(t *testing.T) {
 	}
 }
 
+func TestConvertAnthropicMessagesPreservesExtendedReasoningEffort(t *testing.T) {
+	for _, effort := range []string{"xhigh", "max"} {
+		t.Run(effort, func(t *testing.T) {
+			body := []byte(`{
+				"model":"public-chat","max_tokens":1024,
+				"messages":[{"role":"user","content":"hello"}],
+				"thinking":{"type":"enabled","budget_tokens":1024},
+				"output_config":{"effort":"` + effort + `"}
+			}`)
+			converted, _, err := ConvertRequestWithOptions(body, "grok-4.5", OperationMessages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(converted, &payload); err != nil {
+				t.Fatal(err)
+			}
+			reasoning, ok := payload["reasoning"].(map[string]any)
+			if !ok || reasoning["effort"] != effort {
+				t.Fatalf("reasoning = %#v", payload["reasoning"])
+			}
+		})
+	}
+}
+
 func TestConvertAnthropicToolReferenceValidatesDeclaredTool(t *testing.T) {
 	body := []byte(`{
 		"model":"public","max_tokens":64,
@@ -530,6 +555,19 @@ func TestConvertResponsesJSONToChatAndMessages(t *testing.T) {
 	messagesUsage := messages["usage"].(map[string]any)
 	if messagesUsage["cost_in_usd_ticks"] != float64(158500) || messagesUsage["num_server_side_tools_used"] != float64(2) || messagesUsage["context_details"].(map[string]any)["output_tokens"] != float64(4) {
 		t.Fatalf("messages usage = %#v", messagesUsage)
+	}
+	if messagesUsage["input_tokens"] != float64(8) || messagesUsage["cache_read_input_tokens"] != float64(2) {
+		t.Fatalf("messages cache usage = %#v", messagesUsage)
+	}
+}
+
+func TestAnthropicUsageClampsCacheReadToTotalInput(t *testing.T) {
+	usage := responseUsage{InputTokens: 10, OutputTokens: 2}
+	usage.InputTokensDetails.CachedTokens = 12
+
+	converted := anthropicUsage(usage, 0)
+	if converted["input_tokens"] != int64(0) || converted["cache_read_input_tokens"] != int64(10) {
+		t.Fatalf("clamped messages usage = %#v", converted)
 	}
 }
 
@@ -883,7 +921,7 @@ func TestConvertResponsesStreamMergesPartialUsageFrames(t *testing.T) {
 		want      []string
 	}{
 		{operation: OperationChat, want: []string{`"prompt_tokens":120`, `"completion_tokens":30`, `"cached_tokens":80`, `"reasoning_tokens":12`, `"cost_in_usd_ticks":9000`}},
-		{operation: OperationMessages, want: []string{`"input_tokens":120`, `"output_tokens":30`, `"cache_read_input_tokens":80`, `"cost_in_usd_ticks":9000`}},
+		{operation: OperationMessages, want: []string{`"input_tokens":40`, `"output_tokens":30`, `"cache_read_input_tokens":80`, `"cost_in_usd_ticks":9000`}},
 	}
 	for _, test := range tests {
 		converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), test.operation))

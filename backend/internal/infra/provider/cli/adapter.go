@@ -16,11 +16,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
@@ -29,15 +31,19 @@ import (
 )
 
 type Config struct {
-	BaseURL          string
-	FallbackBaseURL  string
-	ClientVersion    string
-	ClientIdentifier string
-	TokenAuth        string
-	UserAgent        string
+	BaseURL               string
+	FallbackBaseURL       string
+	ClientVersion         string
+	ClientIdentifier      string
+	TokenAuth             string
+	UserAgent             string
+	ResponseHeaderTimeout time.Duration
 }
 
-const subscriptionTierTimeout = 10 * time.Second
+const (
+	subscriptionTierTimeout = 10 * time.Second
+	buildControlTimeout     = 30 * time.Second
+)
 
 // Adapter implements the Grok Build CLI Responses, model, Billing, and OAuth protocols.
 type Adapter struct {
@@ -46,7 +52,7 @@ type Adapter struct {
 	http           *http.Client
 	oauth          *oauthClient
 	cipher         *security.Cipher
-	base           http.RoundTripper
+	base           *buildDirectTransport
 	agentID        string
 	modelsMu       sync.Mutex
 	modelsETags    map[uint64]string
@@ -58,7 +64,8 @@ type Adapter struct {
 }
 
 func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
-	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true, MaxIdleConns: 256, MaxIdleConnsPerHost: 128, MaxConnsPerHost: 256, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second}
+	cfg.ResponseHeaderTimeout = normalizeBuildResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
+	transport := newBuildDirectTransport(cfg.ResponseHeaderTimeout)
 	httpClient := &http.Client{Transport: transport}
 	// The official CLI uses a persistent machine identity. The gateway does not collect machine fingerprints;
 	// instead each backend process generates one random UUID for its lifetime as the Agent identity.
@@ -103,9 +110,53 @@ func (a *Adapter) CredentialMetadata(credential account.Credential) provider.Cre
 }
 
 func (a *Adapter) UpdateConfig(cfg Config) {
+	cfg.ResponseHeaderTimeout = normalizeBuildResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
 	a.cfgMu.Lock()
+	previousTimeout := a.cfg.ResponseHeaderTimeout
 	a.cfg = cfg
 	a.cfgMu.Unlock()
+	if previousTimeout != cfg.ResponseHeaderTimeout && a.base != nil {
+		a.base.UpdateResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
+	}
+}
+
+type buildDirectTransport struct {
+	current atomic.Pointer[http.Transport]
+}
+
+func newBuildDirectTransport(responseHeaderTimeout time.Duration) *buildDirectTransport {
+	value := &buildDirectTransport{}
+	value.current.Store(newBuildHTTPTransport(responseHeaderTimeout))
+	return value
+}
+
+func (t *buildDirectTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return t.current.Load().RoundTrip(request)
+}
+
+func (t *buildDirectTransport) UpdateResponseHeaderTimeout(responseHeaderTimeout time.Duration) {
+	next := newBuildHTTPTransport(responseHeaderTimeout)
+	previous := t.current.Swap(next)
+	if previous != nil {
+		previous.CloseIdleConnections()
+	}
+}
+
+func newBuildHTTPTransport(responseHeaderTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true,
+		MaxIdleConns: 256, MaxIdleConnsPerHost: 128, MaxConnsPerHost: 256,
+		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second,
+		ResponseHeaderTimeout: normalizeBuildResponseHeaderTimeout(responseHeaderTimeout),
+		ExpectContinueTimeout: time.Second,
+	}
+}
+
+func normalizeBuildResponseHeaderTimeout(value time.Duration) time.Duration {
+	if value <= 0 {
+		return settingsdomain.DefaultBuildResponseHeaderTimeout
+	}
+	return value
 }
 
 func (a *Adapter) config() Config {
@@ -141,6 +192,13 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				}
 			}
 		}
+		if err != nil {
+			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+				return invalidConversationResponse(request.Operation, err), nil
+			}
+			return invalidResponsesResponse(err), nil
+		}
+		body, err = normalizeBuildReasoningEffort(body)
 		if err != nil {
 			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 				return invalidConversationResponse(request.Operation, err), nil
@@ -200,6 +258,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		return nil, err
 	}
 	resp, reqURL, reasoningRecovery := a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, base, replayKey, resp, reqURL)
+	var recoveredPrimaryFailure *provider.DiagnosticResponse
 	// Only eligible operations probe XAI with an equivalent request after the Build primary explicitly returns 403.
 	if strings.EqualFold(base, primaryBase) && shouldProbeXAIInferenceFallback(request.Credential, request.Billing, request.Method, request.Path, resp.StatusCode) {
 		// Buffer the primary 403 body and replay it unchanged if fallback fails; never issue a second primary POST.
@@ -209,30 +268,36 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			return nil, readErr
 		}
 		primaryResp := cloneBufferedResponse(resp, primaryBody, primaryTruncated)
-		fallbackBase := a.fallbackBaseURL()
-		if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
-			fallbackBody, fallbackReplayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, fallbackBase)
-			fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(ctx, request, accessToken, fallbackBody, fallbackBase)
-			if fallbackErr == nil {
-				fallbackErr = normalizeGzipResponse(fallbackResp)
-			}
-			fallbackRecovery := reasoningRecoveryOutcome{}
-			if fallbackErr == nil {
-				fallbackResp, fallbackURL, fallbackRecovery = a.recoverReasoningDecodeFailure(ctx, request, accessToken, fallbackBody, fallbackBase, fallbackReplayKey, fallbackResp, fallbackURL)
-			}
-			if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
-				a.activateBuildAPIFallback(ctx, &request.Credential)
-				resp, reqURL, base, body, replayKey = fallbackResp, fallbackURL, fallbackBase, fallbackBody, fallbackReplayKey
-				reasoningRecovery = reasoningRecovery.merge(fallbackRecovery)
-			} else {
+		if isDefinitiveAccountBlockBody(primaryBody) {
+			resp = primaryResp
+		} else {
+			fallbackBase := a.fallbackBaseURL()
+			if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
+				fallbackBody, fallbackReplayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, fallbackBase)
+				fallbackCtx := infraegress.WithPhysicalCallStage(ctx, "plane_fallback")
+				fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(fallbackCtx, request, accessToken, fallbackBody, fallbackBase)
 				if fallbackErr == nil {
-					_ = fallbackResp.Body.Close()
+					fallbackErr = normalizeGzipResponse(fallbackResp)
 				}
-				// Preserve the original primary 403 URL and buffered body without requesting the primary again.
+				fallbackRecovery := reasoningRecoveryOutcome{}
+				if fallbackErr == nil {
+					fallbackResp, fallbackURL, fallbackRecovery = a.recoverReasoningDecodeFailure(ctx, request, accessToken, fallbackBody, fallbackBase, fallbackReplayKey, fallbackResp, fallbackURL)
+				}
+				if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
+					recoveredPrimaryFailure = bufferedFailureDiagnostic(primaryResp, primaryBody, primaryTruncated)
+					a.activateBuildAPIFallback(ctx, &request.Credential)
+					resp, reqURL, base, body, replayKey = fallbackResp, fallbackURL, fallbackBase, fallbackBody, fallbackReplayKey
+					reasoningRecovery = reasoningRecovery.merge(fallbackRecovery)
+				} else {
+					if fallbackErr == nil {
+						_ = fallbackResp.Body.Close()
+					}
+					// Preserve the original primary 403 URL and buffered body without requesting the primary again.
+					resp = primaryResp
+				}
+			} else {
 				resp = primaryResp
 			}
-		} else {
-			resp = primaryResp
 		}
 	}
 	modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
@@ -307,15 +372,15 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				if diagnostic == nil {
 					return nil, convertErr
 				}
-				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, ModelCatalogChanged: modelCatalogChanged}, nil
+				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, ModelCatalogChanged: modelCatalogChanged}, nil
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(converted))
 			resp.Header.Set("Content-Length", strconv.Itoa(len(converted)))
 			resp.Header.Set("Content-Type", "application/json")
-			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, ModelCatalogChanged: modelCatalogChanged}, nil
+			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, ModelCatalogChanged: modelCatalogChanged}, nil
 		}
 	}
-	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, ModelCatalogChanged: modelCatalogChanged}, nil
+	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, RecoveredPrimaryFailure: recoveredPrimaryFailure, ModelCatalogChanged: modelCatalogChanged}, nil
 }
 
 func (a *Adapter) shouldCaptureReplay(request provider.ResponseResourceRequest, resp *http.Response, replayKey string) bool {
@@ -369,6 +434,11 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 		bodyReader = bytes.NewReader(body)
 	}
 	requestCtx := infraegress.WithCredential(ctx, request.Credential)
+	plane := "build"
+	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
+		plane = "xai"
+	}
+	requestCtx = infraegress.WithPhysicalCallPlane(requestCtx, plane)
 	req, err := http.NewRequestWithContext(requestCtx, request.Method, a.urlWithBase(base, request.Path), bodyReader)
 	if err != nil {
 		return nil, "", err
@@ -462,6 +532,8 @@ func invalidConversationResponse(operation string, err error) *provider.Response
 }
 
 func (a *Adapter) ListModels(ctx context.Context, credential account.Credential) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
 	if err != nil {
 		return nil, err
@@ -583,6 +655,8 @@ func (a *Adapter) modelCatalogChanged(accountID uint64, etag string) bool {
 }
 
 func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential) (account.Billing, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
 	if err != nil {
 		return account.Billing{}, err
@@ -604,6 +678,8 @@ func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential)
 }
 
 func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Credential) (provider.RefreshedCredential, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	refreshToken, err := a.cipher.Decrypt(credential.EncryptedRefreshToken)
 	if err != nil {
 		// Decryption failures are usually temporary or mismatched local encryption keys and are recoverable;
@@ -631,10 +707,14 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 }
 
 func (a *Adapter) StartDeviceAuthorization(ctx context.Context) (provider.DeviceAuthorization, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	return a.oauth.startDevice(ctx)
 }
 
 func (a *Adapter) PollDeviceAuthorization(ctx context.Context, deviceCode string) (provider.CredentialSeed, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	tokens, err := a.oauth.pollDevice(ctx, deviceCode)
 	if err != nil {
 		return provider.CredentialSeed{}, err

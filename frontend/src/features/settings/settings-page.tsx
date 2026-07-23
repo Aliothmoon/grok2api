@@ -12,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import { EgressNodes } from "@/features/settings/egress-nodes";
 import { VersionUpdateSection } from "@/features/system/version-update";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -25,6 +26,8 @@ export function SettingsPage() {
   const { form, settingsQuery, updateMutation, reset } = useSettings();
   const [autoCleanConfirm, setAutoCleanConfirm] = useState<"enabled" | "includeDisabled" | null>(null);
   const autoCleanEnabled = form.watch("accounts.autoCleanReauthEnabled") === true;
+  const buildForbiddenReauthEnabled = form.watch("accounts.markBuildForbiddenReauth") === true;
+  const segmentedSelectorEnabled = form.watch("routing.segmentedSelector.enabled") === true;
 
   if (settingsQuery.isError) {
     return <ErrorState message={settingsQuery.error.message} onRetry={() => void settingsQuery.refetch()} />;
@@ -50,7 +53,7 @@ export function SettingsPage() {
 
   return (
     <form className="w-full space-y-5" onSubmit={form.handleSubmit((values) => updateMutation.mutate(values))}>
-      <header className="flex min-h-8 items-center justify-between gap-3">
+      <header className="relative sticky top-8 z-40 -mx-2 flex min-h-12 items-center justify-between gap-3 bg-background px-2 py-2 before:pointer-events-none before:absolute before:inset-x-0 before:-top-[100vh] before:h-[100vh] before:bg-background before:content-[''] lg:top-20">
         <div className="min-w-0">
           <h1 className="text-xl font-medium">{t("settings.title")}</h1>
           <p className="sr-only">{t("settings.description")}</p>
@@ -73,12 +76,13 @@ export function SettingsPage() {
       {loading ? <div className="flex min-h-64 items-center justify-center"><Spinner /></div> : null}
       {snapshot ? (
         <Tabs defaultValue="build" className="flex flex-col gap-7 lg:flex-row lg:items-start">
-          <TabsList className="flex h-auto w-full shrink-0 justify-start gap-1 overflow-visible rounded-none bg-transparent p-0 [&>span]:rounded-md [&>span]:bg-muted/70 [&>span]:shadow-none lg:w-56 lg:flex-col lg:items-stretch">
+          <TabsList className="flex h-auto w-full shrink-0 justify-start gap-1 overflow-visible rounded-none bg-transparent p-0 [&>span]:rounded-md [&>span]:bg-muted/70 [&>span]:shadow-none lg:sticky lg:top-[148px] lg:w-56 lg:flex-col lg:items-stretch">
             <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="build">{t("models.providerGrokBuild")}</TabsTrigger>
             <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="web">{t("settings.web.title")}</TabsTrigger>
             <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="console">{t("console.name")}</TabsTrigger>
             <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="delivery">{t("settings.groups.delivery")}</TabsTrigger>
             <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="policies">{t("settings.groups.policies")}</TabsTrigger>
+            <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="accounts">{t("settings.accounts.title")}</TabsTrigger>
             <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="about">{t("updates.title")}</TabsTrigger>
           </TabsList>
 
@@ -104,6 +108,7 @@ export function SettingsPage() {
               <SettingsField controlId="provider-client-identifier" label={t("settings.provider.clientIdentifier")} description={t("settings.provider.clientIdentifierHelp")} error={form.formState.errors.providerBuild?.clientIdentifier?.message}><Input id="provider-client-identifier" {...form.register("providerBuild.clientIdentifier")} /></SettingsField>
               <SettingsField controlId="provider-token-auth" label={t("settings.provider.tokenAuth")} description={t("settings.provider.tokenAuthHelp")} error={form.formState.errors.providerBuild?.tokenAuth?.message}><Input id="provider-token-auth" autoComplete="off" {...form.register("providerBuild.tokenAuth")} /></SettingsField>
               <SettingsField controlId="provider-user-agent" label={t("settings.provider.userAgent")} description={t("settings.provider.userAgentHelp")} error={form.formState.errors.providerBuild?.userAgent?.message}><Input id="provider-user-agent" {...form.register("providerBuild.userAgent")} /></SettingsField>
+              <SettingsField controlId="provider-response-header-timeout" label={t("settingsBuildTransport.responseHeaderTimeout")} description={t("settingsBuildTransport.responseHeaderTimeoutHelp")} error={form.formState.errors.providerBuild?.responseHeaderTimeout?.message}><Controller control={form.control} name="providerBuild.responseHeaderTimeout" render={({ field }) => <DurationInput id="provider-response-header-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
             </div>
           </SettingsSection>
           </SettingsPane>
@@ -196,9 +201,7 @@ export function SettingsPage() {
             </div>
           </SettingsSection>
 
-          <SettingsSection title={t("settings.egress.title")}>
-            <EgressNodes clearanceMode={activeClearanceMode} />
-          </SettingsSection>
+          <EgressNodes title={t("settings.egress.title")} clearanceMode={activeClearanceMode} />
           </SettingsPane>
 
           <SettingsPane value="policies">
@@ -220,89 +223,6 @@ export function SettingsPage() {
             </div>
           </SettingsSection>
 
-          <SettingsSection title={t("settings.accounts.title")}>
-            <div className="space-y-0">
-              <SettingsField controlId="accounts-auto-clean-reauth-enabled" label={t("settings.accounts.autoCleanReauthEnabled")} description={t("settings.accounts.autoCleanReauthEnabledHelp")}>
-                <Controller control={form.control} name="accounts.autoCleanReauthEnabled" render={({ field }) => (
-                  <div className="flex h-9 items-center">
-                    <Switch
-                      id="accounts-auto-clean-reauth-enabled"
-                      checked={Boolean(field.value)}
-                      onCheckedChange={(checked) => {
-                        if (checked) {
-                          setAutoCleanConfirm("enabled");
-                          return;
-                        }
-                        field.onChange(false);
-                        form.setValue("accounts.autoCleanIncludeDisabled", false, { shouldDirty: true, shouldTouch: true });
-                      }}
-                    />
-                  </div>
-                )} />
-              </SettingsField>
-              <SettingsField controlId="accounts-auto-clean-reauth-interval" label={t("settings.accounts.autoCleanReauthInterval")} description={t("settings.accounts.autoCleanReauthIntervalHelp")} error={form.formState.errors.accounts?.autoCleanReauthInterval?.message}>
-                <Controller control={form.control} name="accounts.autoCleanReauthInterval" render={({ field }) => (
-                  <DurationInput id="accounts-auto-clean-reauth-interval" value={field.value} onChange={field.onChange} disabled={!autoCleanEnabled} />
-                )} />
-              </SettingsField>
-              <SettingsField controlId="accounts-auto-clean-reauth-min-age" label={t("settings.accounts.autoCleanReauthMinAge")} description={t("settings.accounts.autoCleanReauthMinAgeHelp")} error={form.formState.errors.accounts?.autoCleanReauthMinAge?.message}>
-                <Controller control={form.control} name="accounts.autoCleanReauthMinAge" render={({ field }) => (
-                  <DurationInput id="accounts-auto-clean-reauth-min-age" value={field.value} onChange={field.onChange} disabled={!autoCleanEnabled} />
-                )} />
-              </SettingsField>
-              <SettingsField controlId="accounts-auto-clean-include-disabled" label={t("settings.accounts.autoCleanIncludeDisabled")} description={t("settings.accounts.autoCleanIncludeDisabledHelp")}>
-                <Controller control={form.control} name="accounts.autoCleanIncludeDisabled" render={({ field }) => (
-                  <div className="flex h-9 items-center">
-                    <Switch
-                      id="accounts-auto-clean-include-disabled"
-                      checked={Boolean(field.value)}
-                      disabled={!autoCleanEnabled}
-                      onCheckedChange={(checked) => {
-                        if (checked) {
-                          setAutoCleanConfirm("includeDisabled");
-                          return;
-                        }
-                        field.onChange(false);
-                      }}
-                    />
-                  </div>
-                )} />
-              </SettingsField>
-            </div>
-            <AlertDialog open={autoCleanConfirm !== null} onOpenChange={(open) => { if (!open) setAutoCleanConfirm(null); }}>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>
-                    {autoCleanConfirm === "includeDisabled"
-                      ? t("settings.accounts.autoCleanIncludeDisabledTitle")
-                      : t("settings.accounts.autoCleanEnableTitle")}
-                  </AlertDialogTitle>
-                  <AlertDialogDescription>
-                    {autoCleanConfirm === "includeDisabled"
-                      ? t("settings.accounts.autoCleanIncludeDisabledDescription")
-                      : t("settings.accounts.autoCleanEnableDescription")}
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
-                  <AlertDialogAction
-                    className="bg-destructive text-white hover:bg-destructive/90"
-                    onClick={() => {
-                      if (autoCleanConfirm === "includeDisabled") {
-                        form.setValue("accounts.autoCleanIncludeDisabled", true, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
-                      } else {
-                        form.setValue("accounts.autoCleanReauthEnabled", true, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
-                      }
-                      setAutoCleanConfirm(null);
-                    }}
-                  >
-                    {t("settings.accounts.autoCleanConfirm")}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          </SettingsSection>
-
           <SettingsSection title={t("settings.routing.title")}>
             <div className="space-y-0">
               <SettingsField controlId="routing-sticky-ttl" label={t("settings.routing.stickyTTL")} description={t("settings.routing.stickyTTLHelp")} error={form.formState.errors.routing?.stickyTTL?.message}><Controller control={form.control} name="routing.stickyTTL" render={({ field }) => <DurationInput id="routing-sticky-ttl" value={field.value} onChange={field.onChange} />} /></SettingsField>
@@ -311,6 +231,9 @@ export function SettingsPage() {
               <SettingsField controlId="routing-capacity-wait" label={t("settings.routing.capacityWait", { defaultValue: "Saturated account wait" })} description={t("settings.routing.capacityWaitHelp")} error={form.formState.errors.routing?.capacityWait?.message}><Controller control={form.control} name="routing.capacityWait" render={({ field }) => <DurationInput id="routing-capacity-wait" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="routing-max-attempts" label={t("settings.routing.maxAttempts")} description={t("settings.routing.maxAttemptsHelp")} error={form.formState.errors.routing?.maxAttempts?.message}><Input id="routing-max-attempts" type="number" min={1} max={99} {...form.register("routing.maxAttempts", { valueAsNumber: true })} /></SettingsField>
               <SettingsField controlId="routing-prefer-free-build" label={t("settings.routing.preferFreeBuild")} description={t("settings.routing.preferFreeBuildHelp")}><Controller control={form.control} name="routing.preferFreeBuild" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-prefer-free-build" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
+              <SettingsField controlId="routing-segmented-selector-enabled" label={t("settingsRoutingSegmented.enabled")} description={t("settingsRoutingSegmented.enabledHelp")}><Controller control={form.control} name="routing.segmentedSelector.enabled" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-segmented-selector-enabled" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
+              <SettingsField controlId="routing-segmented-min-candidates" label={t("settingsRoutingSegmented.minCandidates")} description={t("settingsRoutingSegmented.minCandidatesHelp")} error={form.formState.errors.routing?.segmentedSelector?.minCandidates?.message}><Input id="routing-segmented-min-candidates" type="number" min={100} max={1_000_000} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.minCandidates", { valueAsNumber: true })} /></SettingsField>
+              <SettingsField controlId="routing-segmented-window-size" label={t("settingsRoutingSegmented.windowSize")} description={t("settingsRoutingSegmented.windowSizeHelp")} error={form.formState.errors.routing?.segmentedSelector?.windowSize?.message}><Input id="routing-segmented-window-size" type="number" min={8} max={256} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.windowSize", { valueAsNumber: true })} /></SettingsField>
             </div>
           </SettingsSection>
 
@@ -319,6 +242,7 @@ export function SettingsPage() {
               <SettingsField controlId="audit-buffer-size" label={t("settings.audit.bufferSize")} description={t("settings.audit.bufferSizeHelp")} badge={t("settings.restartRequired")} error={form.formState.errors.audit?.bufferSize?.message}><Input id="audit-buffer-size" type="number" min={1} max={262_144} {...form.register("audit.bufferSize", { valueAsNumber: true })} /></SettingsField>
               <SettingsField controlId="audit-batch-size" label={t("settings.audit.batchSize")} description={t("settings.audit.batchSizeHelp")} error={form.formState.errors.audit?.batchSize?.message}><Input id="audit-batch-size" type="number" min={1} max={4_096} {...form.register("audit.batchSize", { valueAsNumber: true })} /></SettingsField>
               <SettingsField controlId="audit-flush-interval" label={t("settings.audit.flushInterval")} description={t("settings.audit.flushIntervalHelp")} error={form.formState.errors.audit?.flushInterval?.message}><Controller control={form.control} name="audit.flushInterval" render={({ field }) => <DurationInput id="audit-flush-interval" value={field.value} onChange={field.onChange} />} /></SettingsField>
+              <SettingsField controlId="audit-commit-delay" label={t("settings.audit.commitDelay")} description={t("settings.audit.commitDelayHelp")} error={form.formState.errors.audit?.commitDelayMS?.message}><Input id="audit-commit-delay" type="number" min={1} max={50} {...form.register("audit.commitDelayMS", { valueAsNumber: true })} /></SettingsField>
             </div>
           </SettingsSection>
 
@@ -328,6 +252,118 @@ export function SettingsPage() {
               <SettingsField controlId="client-key-default-concurrency" label={t("settings.clientKeys.maxConcurrent")} description={t("settings.clientKeys.maxConcurrentHelp")} error={form.formState.errors.clientKeyDefaults?.maxConcurrent?.message}><Input id="client-key-default-concurrency" type="number" min={1} max={1_024} {...form.register("clientKeyDefaults.maxConcurrent", { valueAsNumber: true })} /></SettingsField>
             </div>
           </SettingsSection>
+          </SettingsPane>
+
+          <SettingsPane value="accounts">
+            <SettingsSection title={t("settings.accounts.invalidationTitle")}>
+              <div className="space-y-0">
+                <SettingsField controlId="accounts-mark-build-forbidden-reauth" label={t("settingsBuildForbidden.markInvalid")} description={t("settingsBuildForbidden.markInvalidHelp")}>
+                  <Controller control={form.control} name="accounts.markBuildForbiddenReauth" render={({ field }) => (
+                    <div className="flex h-9 items-center">
+                      <Switch id="accounts-mark-build-forbidden-reauth" checked={Boolean(field.value)} onCheckedChange={field.onChange} />
+                    </div>
+                  )} />
+                </SettingsField>
+                <SettingsField
+                  controlId="accounts-build-forbidden-reauth-codes"
+                  className="sm:col-span-2"
+                  label={t("settingsBuildForbidden.codes")}
+                  description={t("settingsBuildForbidden.codesHelp")}
+                  error={form.formState.errors.accounts?.buildForbiddenReauthCodes ? t("settingsBuildForbidden.codesInvalid") : undefined}
+                >
+                  <Textarea
+                    id="accounts-build-forbidden-reauth-codes"
+                    className="min-h-24 font-mono"
+                    disabled={!buildForbiddenReauthEnabled}
+                    placeholder={t("settingsBuildForbidden.codesPlaceholder")}
+                    {...form.register("accounts.buildForbiddenReauthCodes")}
+                  />
+                </SettingsField>
+              </div>
+            </SettingsSection>
+
+            <SettingsSection title={t("settings.accounts.cleanupTitle")}>
+              <div className="space-y-0">
+                <SettingsField controlId="accounts-auto-clean-reauth-enabled" label={t("settings.accounts.autoCleanReauthEnabled")} description={t("settings.accounts.autoCleanReauthEnabledHelp")}>
+                  <Controller control={form.control} name="accounts.autoCleanReauthEnabled" render={({ field }) => (
+                    <div className="flex h-9 items-center">
+                      <Switch
+                        id="accounts-auto-clean-reauth-enabled"
+                        checked={Boolean(field.value)}
+                        onCheckedChange={(checked) => {
+                          if (checked) {
+                            setAutoCleanConfirm("enabled");
+                            return;
+                          }
+                          field.onChange(false);
+                          form.setValue("accounts.autoCleanIncludeDisabled", false, { shouldDirty: true, shouldTouch: true });
+                        }}
+                      />
+                    </div>
+                  )} />
+                </SettingsField>
+                <SettingsField controlId="accounts-auto-clean-reauth-interval" label={t("settings.accounts.autoCleanReauthInterval")} description={t("settings.accounts.autoCleanReauthIntervalHelp")} error={form.formState.errors.accounts?.autoCleanReauthInterval?.message}>
+                  <Controller control={form.control} name="accounts.autoCleanReauthInterval" render={({ field }) => (
+                    <DurationInput id="accounts-auto-clean-reauth-interval" value={field.value} onChange={field.onChange} disabled={!autoCleanEnabled} />
+                  )} />
+                </SettingsField>
+                <SettingsField controlId="accounts-auto-clean-reauth-min-age" label={t("settings.accounts.autoCleanReauthMinAge")} description={t("settings.accounts.autoCleanReauthMinAgeHelp")} error={form.formState.errors.accounts?.autoCleanReauthMinAge?.message}>
+                  <Controller control={form.control} name="accounts.autoCleanReauthMinAge" render={({ field }) => (
+                    <DurationInput id="accounts-auto-clean-reauth-min-age" value={field.value} onChange={field.onChange} disabled={!autoCleanEnabled} />
+                  )} />
+                </SettingsField>
+                <SettingsField controlId="accounts-auto-clean-include-disabled" label={t("settings.accounts.autoCleanIncludeDisabled")} description={t("settings.accounts.autoCleanIncludeDisabledHelp")}>
+                  <Controller control={form.control} name="accounts.autoCleanIncludeDisabled" render={({ field }) => (
+                    <div className="flex h-9 items-center">
+                      <Switch
+                        id="accounts-auto-clean-include-disabled"
+                        checked={Boolean(field.value)}
+                        disabled={!autoCleanEnabled}
+                        onCheckedChange={(checked) => {
+                          if (checked) {
+                            setAutoCleanConfirm("includeDisabled");
+                            return;
+                          }
+                          field.onChange(false);
+                        }}
+                      />
+                    </div>
+                  )} />
+                </SettingsField>
+              </div>
+              <AlertDialog open={autoCleanConfirm !== null} onOpenChange={(open) => { if (!open) setAutoCleanConfirm(null); }}>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>
+                      {autoCleanConfirm === "includeDisabled"
+                        ? t("settings.accounts.autoCleanIncludeDisabledTitle")
+                        : t("settings.accounts.autoCleanEnableTitle")}
+                    </AlertDialogTitle>
+                    <AlertDialogDescription>
+                      {autoCleanConfirm === "includeDisabled"
+                        ? t("settings.accounts.autoCleanIncludeDisabledDescription")
+                        : t("settings.accounts.autoCleanEnableDescription")}
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+                    <AlertDialogAction
+                      className="bg-destructive text-white hover:bg-destructive/90"
+                      onClick={() => {
+                        if (autoCleanConfirm === "includeDisabled") {
+                          form.setValue("accounts.autoCleanIncludeDisabled", true, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
+                        } else {
+                          form.setValue("accounts.autoCleanReauthEnabled", true, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
+                        }
+                        setAutoCleanConfirm(null);
+                      }}
+                    >
+                      {t("settings.accounts.autoCleanConfirm")}
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </SettingsSection>
           </SettingsPane>
 
           <SettingsPane value="about">
