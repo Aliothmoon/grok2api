@@ -13,10 +13,11 @@ import (
 // Selection is the egress snapshot actually selected for an upstream request. It contains only metadata safe for audit
 // and excludes proxy URLs, credentials, User-Agent, and Cookies.
 type Selection struct {
-	NodeID   uint64
-	NodeName string
-	Scope    domain.Scope
-	Proxied  bool
+	NodeID    uint64
+	NodeName  string
+	Scope     domain.Scope
+	Proxied   bool
+	ProxyPool bool // explicit pool mode or account-template sticky proxy ({account})
 }
 
 // Trace retains the most recent actual egress selection per scope. When a request retries egress, audit records the final attempt.

@@ -597,7 +597,7 @@ attemptLoop:
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
 				continue
 			}
-			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name, egressProxyPoolActive(egressTrace, credential.Provider))
 			failureFingerprints[lastFailure.Fingerprint]++
 			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
 				break
@@ -641,7 +641,7 @@ attemptLoop:
 					lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 					break
 				} else {
-					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name, egressProxyPoolActive(egressTrace, credential.Provider))
 				}
 				continue
 			}
@@ -703,7 +703,7 @@ attemptLoop:
 						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 						break attemptLoop
 					}
-					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name, egressProxyPoolActive(egressTrace, credential.Provider))
 					continue attemptLoop
 				}
 				goto handleResponse

@@ -300,7 +300,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	m.mu.Lock()
 	m.inflight[selected.ID]++
 	m.mu.Unlock()
-	recordSelection(ctx, Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != ""})
+	recordSelection(ctx, Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != "", ProxyPool: proxyPool})
 	var once sync.Once
 	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, proxyPool: proxyPool, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
 		once.Do(func() {

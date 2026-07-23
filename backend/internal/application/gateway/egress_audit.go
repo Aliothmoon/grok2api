@@ -53,3 +53,13 @@ func primaryEgressScope(provider accountdomain.Provider) egressdomain.Scope {
 		return egressdomain.ScopeBuild
 	}
 }
+
+// egressProxyPoolActive reports whether the latest selected egress for this provider
+// is an effective proxy pool (explicit pool mode or account-template sticky proxy).
+func egressProxyPoolActive(trace *infraegress.Trace, provider accountdomain.Provider) bool {
+	if trace == nil {
+		return false
+	}
+	selection, ok := trace.Selection(primaryEgressScope(provider))
+	return ok && selection.ProxyPool
+}

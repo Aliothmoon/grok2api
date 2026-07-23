@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -8,6 +10,49 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
+
+func TestTransportUpstreamFailureFingerprintIsAccountScopedOnlyForProxyPool(t *testing.T) {
+	networkErr := errors.New(`Post "https://cli-chat-proxy.grok.com/v1/responses": http2: timeout awaiting response headers`)
+
+	// Shared single proxy / direct: keep coarse fingerprint so two failures still short-circuit.
+	sharedA := newTransportUpstreamFailure(networkErr, 5471, "account-a", false)
+	sharedB := newTransportUpstreamFailure(networkErr, 5472, "account-b", false)
+	if sharedA.Fingerprint != "upstream_network_error" || sharedB.Fingerprint != "upstream_network_error" {
+		t.Fatalf("non-pool fingerprints = %q / %q", sharedA.Fingerprint, sharedB.Fingerprint)
+	}
+	if sharedA.AccountScoped || sharedB.AccountScoped {
+		t.Fatal("非代理池传输失败不应标记 AccountScoped")
+	}
+
+	// Proxy pool / sticky account template: each account is a different egress path.
+	first := newTransportUpstreamFailure(networkErr, 5471, "account-a", true)
+	second := newTransportUpstreamFailure(networkErr, 5472, "account-b", true)
+	if first.Code != "upstream_network_error" || second.Code != "upstream_network_error" {
+		t.Fatalf("code = %q / %q", first.Code, second.Code)
+	}
+	if first.Fingerprint != "upstream_network_error:account:5471" {
+		t.Fatalf("first fingerprint = %q", first.Fingerprint)
+	}
+	if second.Fingerprint != "upstream_network_error:account:5472" {
+		t.Fatalf("second fingerprint = %q", second.Fingerprint)
+	}
+	if first.Fingerprint == second.Fingerprint {
+		t.Fatal("代理池下不同账号的传输失败指纹必须区分")
+	}
+	if !first.AccountScoped || !second.AccountScoped {
+		t.Fatal("代理池下带账号的传输失败应标记 AccountScoped")
+	}
+
+	deadline := newTransportUpstreamFailure(context.DeadlineExceeded, 99, "account-c", true)
+	if deadline.Code != "upstream_timeout" || deadline.Fingerprint != "upstream_timeout:account:99" {
+		t.Fatalf("deadline failure = %#v", deadline)
+	}
+
+	anonymous := newTransportUpstreamFailure(networkErr, 0, "", true)
+	if anonymous.Fingerprint != "upstream_network_error" || anonymous.AccountScoped {
+		t.Fatalf("代理池但无账号 = %#v", anonymous)
+	}
+}
 
 func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 	tests := []struct {
