@@ -48,7 +48,6 @@ const minimumTextBillingReservationTTL = 2 * time.Hour
 const billingReservationCrashGrace = 10 * time.Minute
 const mediaBillingReservationTTL = 24 * time.Hour
 const modelCatalogRefreshTimeout = 30 * time.Second
-const maxQuotaFailoverAttempts = 10
 const accountStateWriteTimeout = 3 * time.Second
 
 var freeQuotaUsagePattern = regexp.MustCompile(`(?i)tokens\s*\(actual/limit\)\s*:\s*([0-9]+)\s*/\s*([0-9]+)`)
@@ -855,12 +854,6 @@ attemptLoop:
 				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
 					break
 				}
-			}
-			// Definite account quota exhaustion should not consume the small generic
-			// retry budget while healthy accounts remain in a large pool. Stored
-			// responses stay pinned and therefore never receive this extension.
-			if ownership == nil && lastFailure.AccountScoped && lastFailure.QuotaExhausted && attempts < maxQuotaFailoverAttempts {
-				attempts++
 			}
 			continue
 		}
