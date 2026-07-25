@@ -180,12 +180,16 @@ func readinessSnapshot(
 		if usable[route.Provider] || route.SupportedAccounts == 0 {
 			continue
 		}
-		candidates, listErr := accounts.ListRoutingCandidates(ctx, route.Provider, route.ID, route.UpstreamModel, providers.QuotaMode(route.Provider, route.UpstreamModel))
+		// Readiness runs only at startup; use ListEnabled so encrypted credential
+		// presence and expiry are visible. Routing projections intentionally drop
+		// secrets and would falsely report all accounts as unusable here.
+		credentials, listErr := accounts.ListEnabled(ctx, route.Provider)
 		if listErr != nil {
 			providerErrors[route.Provider] = true
 			continue
 		}
-		for _, candidate := range candidates {
+		for _, credential := range credentials {
+			candidate := accountdomain.RoutingCandidate{Credential: credential}
 			if startupCandidateUsable(candidate, now, providers) {
 				usable[route.Provider] = true
 				break
