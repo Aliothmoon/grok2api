@@ -82,7 +82,7 @@ func frontendFile(root, requestPath string) (string, bool) {
 
 func isBackendPath(value string) bool {
 	cleanPath := path.Clean("/" + value)
-	for _, prefix := range []string{"/api", "/v1", "/swagger"} {
+	for _, prefix := range []string{"/api", "/v1", "/swagger", "/debug"} {
 		if cleanPath == prefix || strings.HasPrefix(cleanPath, prefix+"/") {
 			return true
 		}

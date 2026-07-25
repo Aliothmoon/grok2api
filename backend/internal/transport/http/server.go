@@ -43,6 +43,7 @@ type Dependencies struct {
 	ConcurrencyGate    *middleware.ConcurrencyGate
 	SecureCookies      bool
 	SwaggerEnabled     bool
+	PprofEnabled       bool
 	PublicAPIBaseURL   string
 	FrontendStaticPath string
 	// Readiness 返回可观测的分层就绪状态。Ready 仅为旧调用方保留。
@@ -131,6 +132,11 @@ func New(deps Dependencies) *gin.Engine {
 	})
 	if deps.SwaggerEnabled {
 		router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	}
+	// Register before SPA NoRoute so /debug/pprof is not swallowed by index.html.
+	if deps.PprofEnabled {
+		registerPprof(router)
+		deps.Logger.Info("pprof_enabled", "path", "/debug/pprof/")
 	}
 	mediaHandler := mediahttp.NewHandler(deps.Media)
 	mediaHandler.RegisterPublic(router)

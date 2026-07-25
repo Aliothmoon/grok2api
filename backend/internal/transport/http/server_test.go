@@ -171,3 +171,44 @@ func TestSwaggerRegistrationFollowsStartupConfig(t *testing.T) {
 		t.Fatalf("swagger title = %q, want %q", document.Info.Title, "Grok2API")
 	}
 }
+
+func TestPprofRegistrationFollowsStartupConfig(t *testing.T) {
+	disabledDeps := testDependencies()
+	disabledDeps.Logger = slog.Default()
+	disabled := New(disabledDeps)
+	disabledRequest := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+	disabledRecorder := httptest.NewRecorder()
+	disabled.ServeHTTP(disabledRecorder, disabledRequest)
+	if disabledRecorder.Code != http.StatusNotFound {
+		t.Fatalf("disabled pprof status = %d, want %d body=%s", disabledRecorder.Code, http.StatusNotFound, disabledRecorder.Body.String())
+	}
+
+	enabledDeps := testDependencies()
+	enabledDeps.Logger = slog.Default()
+	enabledDeps.PprofEnabled = true
+	// Ensure SPA catch-all cannot swallow pprof when a frontend build is present.
+	staticRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(staticRoot, "index.html"), []byte("<!doctype html><title>spa</title>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	enabledDeps.FrontendStaticPath = staticRoot
+	enabled := New(enabledDeps)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/goroutine", "/debug/pprof/heap"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		recorder := httptest.NewRecorder()
+		enabled.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("enabled pprof %s status = %d, want %d body=%s", path, recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if strings.Contains(recorder.Body.String(), "<!doctype html>") {
+			t.Fatalf("enabled pprof %s returned SPA HTML", path)
+		}
+	}
+}
+
+func TestBackendPathsIncludeDebugPrefix(t *testing.T) {
+	if !isBackendPath("/debug/pprof/goroutine") {
+		t.Fatal("expected /debug/pprof/goroutine to be treated as a backend path")
+	}
+}

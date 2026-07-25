@@ -14,6 +14,8 @@ server:
   requestTimeout: 2h
   # [按需修改] 仅在本地或受信任环境开启，生产环境保持 false。
   swaggerEnabled: false
+  # [按需修改] 开启后暴露 /debug/pprof/*（含 CPU/heap/goroutine）。公网或不可信网络务必保持 false。
+  pprofEnabled: false
 
 auth:
   # [通常不要修改] 管理端访问与刷新令牌有效期。

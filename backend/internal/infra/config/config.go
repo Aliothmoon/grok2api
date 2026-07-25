@@ -71,6 +71,8 @@ type ServerConfig struct {
 	ReadTimeout           Duration `yaml:"readTimeout"`
 	RequestTimeout        Duration `yaml:"requestTimeout"`
 	SwaggerEnabled        bool     `yaml:"swaggerEnabled"`
+	// PprofEnabled exposes /debug/pprof/* for runtime profiling. Keep false on public deployments.
+	PprofEnabled bool `yaml:"pprofEnabled"`
 }
 
 type FrontendConfig struct {
