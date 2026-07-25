@@ -1358,13 +1358,16 @@ func (s *Selector) patchBaseAccount(event repository.InvalidationEvent) {
 			break
 		}
 	}
+	// L3 snapshots must adopt the just-bumped base version so they stay fresh;
+	// otherwise the version check would treat every patched snapshot as stale.
+	nextBaseGen := s.routingBaseVersionLocked(provider)
 	if drop {
-		if patchAssembledAccountLocked(s.candidates, provider, accountID, nil) {
+		if patchAssembledAccountLocked(s.candidates, provider, accountID, nil, nextBaseGen, routingLayerVersion{}) {
 			s.cacheStats.assembledPatches.Add(1)
 		}
 		return
 	}
-	if patchAssembledAccountLocked(s.candidates, provider, accountID, replacement) {
+	if patchAssembledAccountLocked(s.candidates, provider, accountID, replacement, nextBaseGen, routingLayerVersion{}) {
 		s.cacheStats.assembledPatches.Add(1)
 	}
 }
@@ -1538,15 +1541,22 @@ func (s *Selector) bulkClearOverlayModel(provider account.Provider, upstreamMode
 
 // patchAssembledAccountLocked updates or drops one account in warm L3 snapshots.
 // caller must hold candidateMu. nextBase nil means drop. Overlay fields are preserved
-// when updating from a base replacement.
-func patchAssembledAccountLocked(candidates map[candidateCacheKey]candidateSnapshot, provider account.Provider, accountID uint64, nextBase *account.RoutingAccountBase) bool {
+// when updating from a base replacement. baseGen/overlayGen, when non-zero, are adopted
+// by patched snapshots so the next freshness check passes without a reload.
+func patchAssembledAccountLocked(candidates map[candidateCacheKey]candidateSnapshot, provider account.Provider, accountID uint64, nextBase *account.RoutingAccountBase, baseGen, overlayGen routingLayerVersion) bool {
 	changed := false
+	now := time.Now().UTC()
 	for key, snap := range candidates {
 		if provider != "" && key.provider != provider {
 			continue
 		}
 		if nextBase == nil {
 			if dropAssembledAccountInSnapshot(&snap, accountID) {
+				// Drop keeps overlayGen; refresh baseGen so the shrunk snapshot stays valid.
+				if baseGen != (routingLayerVersion{}) {
+					snap.baseGen = baseGen
+				}
+				snap.loadedAt = now
 				candidates[key] = snap
 				changed = true
 			}
@@ -1565,6 +1575,10 @@ func patchAssembledAccountLocked(candidates map[candidateCacheKey]candidateSnaps
 		candidate.QuotaRecovery = nextBase.QuotaRecovery
 		next[index] = candidate
 		snap.values = next
+		if baseGen != (routingLayerVersion{}) {
+			snap.baseGen = baseGen
+		}
+		snap.loadedAt = now
 		// byAccount indexes unchanged
 		candidates[key] = snap
 		changed = true

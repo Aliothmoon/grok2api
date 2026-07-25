@@ -198,6 +198,60 @@ func (r *overlayCountingRepo) ListRoutingAccountOverlays(ctx context.Context, pr
 	return r.countingListBasesRepo.ListRoutingAccountOverlays(ctx, provider, modelRouteID, upstreamModel)
 }
 
+func TestAccountScopedBasePatchKeepsL3FreshForSubsequentHit(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "l3-fresh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inner := relational.NewAccountRepository(database)
+	repo := wrapCountingBases(inner)
+	primary, _, err := inner.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "primary", SourceKey: "primary",
+		EncryptedAccessToken: "a", AuthStatus: account.AuthStatusActive, Enabled: true, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := inner.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "backup", SourceKey: "backup",
+		EncryptedAccessToken: "a", AuthStatus: account.AuthStatusActive, Enabled: true, Priority: 10, MaxConcurrent: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(repo, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	inner.SetInvalidationObserver(func(_ context.Context, event repository.InvalidationEvent) {
+		selector.ApplyInvalidation(event)
+	})
+
+	// Warm L3.
+	if _, err := selector.loadCandidates(ctx, account.ProviderBuild, 0, "model", "", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	hitsBefore := selector.CacheStats().Assembled.Hits
+
+	// Account-scoped base event patches L3 in place.
+	selector.MarkFailure(ctx, primary, 429, time.Hour)
+	stats := selector.CacheStats()
+	if stats.Assembled.Patches < 1 {
+		t.Fatalf("expected assembled patch: %#v", stats)
+	}
+
+	// Subsequent load for the same key MUST be a cache hit (L3 stayed fresh after patch).
+	if _, err := selector.loadCandidates(ctx, account.ProviderBuild, 0, "model", "", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	hitsAfter := selector.CacheStats().Assembled.Hits
+	if hitsAfter <= hitsBefore {
+		t.Fatalf("post-patch L3 load was a miss, expected hit: before=%d after=%d stats=%#v", hitsBefore, hitsAfter, selector.CacheStats())
+	}
+}
+
 func TestModelScopedOverlayPatchDoesNotReloadFullModelOverlay(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "overlay-patch.db"))
