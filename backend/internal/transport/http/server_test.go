@@ -211,4 +211,81 @@ func TestBackendPathsIncludeDebugPrefix(t *testing.T) {
 	if !isBackendPath("/debug/pprof/goroutine") {
 		t.Fatal("expected /debug/pprof/goroutine to be treated as a backend path")
 	}
+	if !isBackendPath("/debug/cache/stats") {
+		t.Fatal("expected /debug/cache/stats to be treated as a backend path")
+	}
+}
+
+func TestCacheStatsRegistrationFollowsPprofGate(t *testing.T) {
+	disabledDeps := testDependencies()
+	disabledDeps.Logger = slog.Default()
+	disabledDeps.CacheStats = func() any { return map[string]any{"assembled": map[string]any{"hits": 1}} }
+	disabled := New(disabledDeps)
+	disabledReq := httptest.NewRequest(http.MethodGet, "/debug/cache/stats", nil)
+	disabledRec := httptest.NewRecorder()
+	disabled.ServeHTTP(disabledRec, disabledReq)
+	if disabledRec.Code != http.StatusNotFound {
+		t.Fatalf("pprof disabled: cache stats status=%d want 404 body=%s", disabledRec.Code, disabledRec.Body.String())
+	}
+
+	var resetCalls int
+	enabledDeps := testDependencies()
+	enabledDeps.Logger = slog.Default()
+	enabledDeps.PprofEnabled = true
+	enabledDeps.CacheStats = func() any {
+		return map[string]any{
+			"assembled": map[string]any{"hits": 3, "misses": 1, "loads": 1, "hit_ratio": 0.75},
+			"base":      map[string]any{"hits": 2, "misses": 1, "loads": 1, "patches": 1, "rebuilds": 0},
+		}
+	}
+	enabledDeps.ResetCacheStats = func() { resetCalls++ }
+	staticRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(staticRoot, "index.html"), []byte("<!doctype html><title>spa</title>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	enabledDeps.FrontendStaticPath = staticRoot
+	enabled := New(enabledDeps)
+
+	req := httptest.NewRequest(http.MethodGet, "/debug/cache/stats", nil)
+	rec := httptest.NewRecorder()
+	enabled.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enabled cache stats status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "<!doctype html>") {
+		t.Fatalf("cache stats returned SPA HTML: %s", rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["enabled"] != true {
+		t.Fatalf("body=%#v", body)
+	}
+	// Response may nest under "stats" or "layers" depending on handler shape.
+	statsObj, _ := body["stats"].(map[string]any)
+	if statsObj == nil {
+		statsObj, _ = body["layers"].(map[string]any)
+	}
+	if statsObj == nil || (statsObj["assembled"] == nil && statsObj["Assembled"] == nil) {
+		t.Fatalf("missing stats payload: %#v", body)
+	}
+
+	resetReq := httptest.NewRequest(http.MethodPost, "/debug/cache/stats/reset", nil)
+	resetRec := httptest.NewRecorder()
+	enabled.ServeHTTP(resetRec, resetReq)
+	if resetRec.Code != http.StatusOK || resetCalls != 1 {
+		t.Fatalf("reset status=%d calls=%d body=%s", resetRec.Code, resetCalls, resetRec.Body.String())
+	}
+
+	// Mutating GET must not be registered (prefetch-safe).
+	getReset := httptest.NewRequest(http.MethodGet, "/debug/cache/stats/reset", nil)
+	getRec := httptest.NewRecorder()
+	enabled.ServeHTTP(getRec, getReset)
+	if getRec.Code == http.StatusOK && resetCalls > 1 {
+		t.Fatalf("GET reset mutated state: status=%d calls=%d", getRec.Code, resetCalls)
+	}
+	if resetCalls != 1 {
+		t.Fatalf("GET reset should not call reset handler: calls=%d", resetCalls)
+	}
 }

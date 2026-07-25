@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,6 +38,7 @@ func TestSelectorAssembledCacheMissesWhenEpochChanges(t *testing.T) {
 	if _, err := selector.loadCandidates(context.Background(), account.ProviderBuild, 0, "model-a", "", now); err != nil {
 		t.Fatal(err)
 	}
+	// Account-scoped state invalidation drops assembled but keeps warm base (no full List).
 	selector.ApplyInvalidation(repository.InvalidationEvent{
 		Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: 1,
 	})
@@ -44,9 +46,116 @@ func TestSelectorAssembledCacheMissesWhenEpochChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseCalls, overlayCalls := repo.callCounts("model-a")
-	if baseCalls != 2 || overlayCalls != 1 {
-		t.Fatalf("state invalidation should reload base only base=%d overlay=%d", baseCalls, overlayCalls)
+	if baseCalls != 1 {
+		t.Fatalf("account-scoped invalidation should not full-reload base: base=%d", baseCalls)
 	}
+	if overlayCalls != 1 {
+		t.Fatalf("overlay should stay warm: overlay=%d", overlayCalls)
+	}
+	// Bulk base invalidation without AccountID clears L1 and forces reload.
+	selector.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild,
+	})
+	if _, err := selector.loadCandidates(context.Background(), account.ProviderBuild, 0, "model-a", "", now); err != nil {
+		t.Fatal(err)
+	}
+	baseCalls, _ = repo.callCounts("model-a")
+	if baseCalls != 2 {
+		t.Fatalf("bulk invalidation should reload base: base=%d", baseCalls)
+	}
+}
+
+func TestSelectorAccountPatchKeepsOtherAccountsWithoutFullReload(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "patch-base.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	primary, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "p", SourceKey: "p",
+		EncryptedAccessToken: "a", AuthStatus: account.AuthStatusActive, Enabled: true, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "b", SourceKey: "b",
+		EncryptedAccessToken: "a", AuthStatus: account.AuthStatusActive, Enabled: true, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listCalls atomic.Int64
+	wrapped := &countingRoutingRepo{AccountRepository: accounts, listBase: &listCalls}
+	selector := NewSelector(wrapped, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	accounts.SetInvalidationObserver(func(_ context.Context, event repository.InvalidationEvent) {
+		selector.ApplyInvalidation(event)
+	})
+	if _, err := selector.loadCandidates(ctx, account.ProviderBuild, 0, "m", "", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if listCalls.Load() != 1 {
+		t.Fatalf("warm list calls=%d", listCalls.Load())
+	}
+	// Cool primary via real health update + invalidation path.
+	until := time.Now().UTC().Add(time.Hour)
+	if err := accounts.UpdateHealth(ctx, primary.ID, 1, &until, "cool", false); err != nil {
+		t.Fatal(err)
+	}
+	// Observer may not fire from UpdateHealth without notify; apply explicit event with AccountID.
+	selector.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: primary.ID,
+	})
+	if listCalls.Load() != 1 {
+		t.Fatalf("patch should not full-list: listCalls=%d", listCalls.Load())
+	}
+	lease, err := selector.Acquire(ctx, account.ProviderBuild, 0, "m", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Credential.ID != backup.ID {
+		t.Fatalf("selected %d want backup %d", lease.Credential.ID, backup.ID)
+	}
+	lease.Release()
+	stats := selector.CacheStats()
+	if stats.Base.Patches < 1 {
+		t.Fatalf("expected patch counter: %#v", stats.Base)
+	}
+}
+
+type countingRoutingRepo struct {
+	repository.AccountRepository
+	listBase *atomic.Int64
+}
+
+func (r *countingRoutingRepo) ListRoutingAccountBases(ctx context.Context, provider account.Provider, quotaMode string) ([]account.RoutingAccountBase, error) {
+	r.listBase.Add(1)
+	return r.AccountRepository.(interface {
+		ListRoutingAccountBases(context.Context, account.Provider, string) ([]account.RoutingAccountBase, error)
+	}).ListRoutingAccountBases(ctx, provider, quotaMode)
+}
+
+func (r *countingRoutingRepo) ListRoutingAccountOverlays(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel string) (account.RoutingOverlaySnapshot, error) {
+	return r.AccountRepository.(interface {
+		ListRoutingAccountOverlays(context.Context, account.Provider, uint64, string) (account.RoutingOverlaySnapshot, error)
+	}).ListRoutingAccountOverlays(ctx, provider, modelRouteID, upstreamModel)
+}
+
+func (r *countingRoutingRepo) GetRoutingAccountBase(ctx context.Context, id uint64, quotaMode string) (account.RoutingAccountBase, error) {
+	return r.AccountRepository.(interface {
+		GetRoutingAccountBase(context.Context, uint64, string) (account.RoutingAccountBase, error)
+	}).GetRoutingAccountBase(ctx, id, quotaMode)
+}
+
+func (r *countingRoutingRepo) GetRoutingCandidate(ctx context.Context, id uint64, modelRouteID uint64, upstreamModel, quotaMode string) (account.RoutingCandidate, error) {
+	return r.AccountRepository.(interface {
+		GetRoutingCandidate(context.Context, uint64, uint64, string, string) (account.RoutingCandidate, error)
+	}).GetRoutingCandidate(ctx, id, modelRouteID, upstreamModel, quotaMode)
 }
 
 func TestSelectorTokenCredentialInvalidationDoesNotReloadBase(t *testing.T) {

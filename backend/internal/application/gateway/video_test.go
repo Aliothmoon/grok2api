@@ -199,7 +199,7 @@ func TestRunVideoJobHydratesProjectionBeforeGenerate(t *testing.T) {
 	service.logger = slog.Default()
 
 	service.runVideoJob(ctx, media.Job{
-		ID: "video_hydrate", AccountID: credential.ID, Provider: string(account.ProviderWeb),
+		ID: "video_hydrate", RequestID: "req-video-hydrate", AccountID: credential.ID, Provider: string(account.ProviderWeb),
 		Prompt: "hello", Seconds: 4, Size: "1:1", Quality: "720p", InputJSON: `{}`,
 	}, route)
 

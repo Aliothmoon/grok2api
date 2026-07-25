@@ -1826,7 +1826,11 @@ func (r *AccountRepository) UpdateHealth(ctx context.Context, id uint64, failure
 	}
 	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id = ?", id).Updates(updates).Error
 	if err == nil && !success {
-		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, AccountID: id})
+		var provider account.Provider
+		_ = r.db.db.WithContext(ctx).Model(&accountModel{}).Select("provider").Where("id = ?", id).Scan(&provider).Error
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{
+			Kind: repository.InvalidationAccountStateChanged, Provider: provider, AccountID: id,
+		})
 	}
 	return err
 }

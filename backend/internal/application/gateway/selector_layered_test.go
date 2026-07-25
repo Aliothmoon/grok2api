@@ -77,6 +77,48 @@ func (r *layeredAccountRepository) callCounts(model string) (int, int) {
 	return r.baseCalls, r.overlayCalls[model]
 }
 
+// GetRoutingAccountBase implements repository.RoutingAccountLookup for account-scoped L1 patches.
+func (r *layeredAccountRepository) GetRoutingAccountBase(_ context.Context, id uint64, _ string) (account.RoutingAccountBase, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, base := range r.bases {
+		if base.Credential.ID == id {
+			return base, nil
+		}
+	}
+	if r.nextBases != nil {
+		for _, base := range r.nextBases {
+			if base.Credential.ID == id {
+				return base, nil
+			}
+		}
+	}
+	return account.RoutingAccountBase{}, repository.ErrNotFound
+}
+
+// GetRoutingCandidate implements repository.RoutingAccountLookup.
+func (r *layeredAccountRepository) GetRoutingCandidate(ctx context.Context, id uint64, _ uint64, upstreamModel, quotaMode string) (account.RoutingCandidate, error) {
+	base, err := r.GetRoutingAccountBase(ctx, id, quotaMode)
+	if err != nil {
+		return account.RoutingCandidate{}, err
+	}
+	candidate := account.RoutingCandidate{
+		Credential: base.Credential, Billing: base.Billing, QuotaWindow: base.QuotaWindow, QuotaRecovery: base.QuotaRecovery,
+	}
+	r.mu.Lock()
+	overlay := r.overlays[upstreamModel]
+	r.mu.Unlock()
+	for _, value := range overlay.Values {
+		if value.AccountID == id {
+			candidate.ModelCapabilityKnown = value.ModelCapabilityKnown
+			candidate.SupportsModel = value.SupportsModel
+			candidate.ModelQuotaBlock = value.ModelQuotaBlock
+			break
+		}
+	}
+	return candidate, nil
+}
+
 func TestSelectorLayeredCacheReusesBaseAcrossModels(t *testing.T) {
 	repo := newLayeredRepositoryFixture()
 	selector := NewSelector(repo, nil, nil, nil, time.Hour, time.Second, time.Minute)

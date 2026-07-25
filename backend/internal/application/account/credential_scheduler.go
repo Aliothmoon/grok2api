@@ -18,15 +18,49 @@ type CredentialStartupReport struct {
 }
 
 // ReconcileCredentialSchedules 为升级前账号补齐持久化调度，不解密凭据，也不访问上游。
+// force=true 时始终执行 Backfill（启动恢复）；force=false 时受 credentialReconcileMinInterval 节流，
+// 避免稳态 due 循环对已补齐库做空转扫表。
 func (s *Service) ReconcileCredentialSchedules(ctx context.Context) (int, error) {
+	return s.reconcileCredentialSchedules(ctx, true)
+}
+
+func (s *Service) reconcileCredentialSchedules(ctx context.Context, force bool) (int, error) {
+	if !force {
+		s.credentialReconcileMu.Lock()
+		elapsed := s.now().Sub(s.lastCredentialReconcileAt)
+		if !s.lastCredentialReconcileAt.IsZero() && elapsed < credentialReconcileMinInterval {
+			s.credentialReconcileMu.Unlock()
+			return 0, nil
+		}
+		// Claim the interval before releasing the mutex so concurrent non-force
+		// callers cannot both pass the throttle and run full Backfill.
+		s.lastCredentialReconcileAt = s.now()
+		s.credentialReconcileMu.Unlock()
+	}
 	total := 0
 	for {
 		count, err := s.accounts.BackfillCredentialRefreshSchedules(ctx, s.now(), credentialRefreshBatchSize)
 		total += count
 		if err != nil || count < credentialRefreshBatchSize {
+			if err == nil {
+				s.credentialReconcileMu.Lock()
+				s.lastCredentialReconcileAt = s.now()
+				s.credentialReconcileMu.Unlock()
+				s.credentialReconcileCalls.Add(1)
+			} else if !force {
+				// Allow a retry soon after a failed claimed reconcile.
+				s.credentialReconcileMu.Lock()
+				s.lastCredentialReconcileAt = time.Time{}
+				s.credentialReconcileMu.Unlock()
+			}
 			return total, err
 		}
 	}
+}
+
+// CredentialReconcileCallCount reports how many full Backfill reconcile passes completed (tests/metrics).
+func (s *Service) CredentialReconcileCallCount() uint64 {
+	return s.credentialReconcileCalls.Load()
 }
 
 // RecoverCriticalCredentials 在启动预算内仅恢复缺失、已过期、两分钟内到期或失败重试到期的凭据。
@@ -109,7 +143,8 @@ func (s *Service) RunCredentialRefresh(ctx context.Context) {
 }
 
 func (s *Service) refreshDueCredentials(ctx context.Context) error {
-	if _, err := s.ReconcileCredentialSchedules(ctx); err != nil {
+	// Throttled migration/repair only — due selection uses refresh_due_at index.
+	if _, err := s.reconcileCredentialSchedules(ctx, false); err != nil {
 		return err
 	}
 	for {

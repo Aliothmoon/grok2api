@@ -44,6 +44,10 @@ type Dependencies struct {
 	SecureCookies      bool
 	SwaggerEnabled     bool
 	PprofEnabled       bool
+	// CacheStats, when non-nil and PprofEnabled, is served at GET /debug/cache/stats.
+	CacheStats func() any
+	// ResetCacheStats, when non-nil and PprofEnabled, is served at POST /debug/cache/stats/reset.
+	ResetCacheStats    func()
 	PublicAPIBaseURL   string
 	FrontendStaticPath string
 	// Readiness 返回可观测的分层就绪状态。Ready 仅为旧调用方保留。
@@ -133,10 +137,14 @@ func New(deps Dependencies) *gin.Engine {
 	if deps.SwaggerEnabled {
 		router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 	}
-	// Register before SPA NoRoute so /debug/pprof is not swallowed by index.html.
+	// Register before SPA NoRoute so /debug/* is not swallowed by index.html.
 	if deps.PprofEnabled {
 		registerPprof(router)
 		deps.Logger.Info("pprof_enabled", "path", "/debug/pprof/")
+		if deps.CacheStats != nil {
+			registerCacheStats(router, deps.CacheStats, deps.ResetCacheStats)
+			deps.Logger.Info("cache_stats_enabled", "path", "/debug/cache/stats")
+		}
 	}
 	mediaHandler := mediahttp.NewHandler(deps.Media)
 	mediaHandler.RegisterPublic(router)

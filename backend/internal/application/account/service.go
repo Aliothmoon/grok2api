@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
@@ -48,7 +49,10 @@ const (
 	credentialRefreshTimeout     time.Duration = 30 * time.Second
 	credentialRefreshStateTTL    time.Duration = 5 * time.Second
 	credentialStateWriteTimeout  time.Duration = 5 * time.Second
-	credentialRefreshBatchSize                 = 100
+	// credentialReconcileMinInterval limits full Backfill of refresh_due_at to a
+	// migration/repair path. Steady-state due selection uses ListDue only.
+	credentialReconcileMinInterval time.Duration = 15 * time.Minute
+	credentialRefreshBatchSize                   = 100
 	managedTaskWorkerCeiling                   = 50
 	webQuotaRefreshQueueSize                   = 4096
 	webQuotaRefreshTimeout                     = 30 * time.Second
@@ -313,8 +317,11 @@ type Service struct {
 	conversionPool        *batch.Pool
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
-	credentialRefreshWake chan struct{}
-	autoCleanMu           sync.RWMutex
+	credentialRefreshWake      chan struct{}
+	credentialReconcileMu      sync.Mutex
+	lastCredentialReconcileAt  time.Time
+	credentialReconcileCalls   atomic.Uint64 // test/observability: full Reconcile invocations
+	autoCleanMu                sync.RWMutex
 	autoClean             AutoCleanConfig
 	autoCleanRevision     uint64
 	autoCleanWake         chan struct{}
