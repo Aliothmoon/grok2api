@@ -6,7 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"errors"
 	"io"
 	"net/http"

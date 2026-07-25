@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"errors"
 	"fmt"
 	"io"
@@ -751,6 +751,11 @@ func TestDecodeDirectFileUploadResponse(t *testing.T) {
 	}
 	if _, err := decodeDirectFileUploadResponse(strings.NewReader(`{"uploadId":"upload-1","fileMetadata":{}}`)); err == nil {
 		t.Fatal("incomplete V2 upload response was accepted")
+	}
+
+	_, err = decodeDirectFileUploadResponse(strings.NewReader("<html>bad gateway</html>"))
+	if err == nil || !strings.Contains(err.Error(), "V2 上传文件响应无效") || strings.Contains(err.Error(), "<html>bad gateway</html>") {
+		t.Fatalf("invalid V2 response error = %v", err)
 	}
 }
 

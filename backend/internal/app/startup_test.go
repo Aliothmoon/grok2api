@@ -2,7 +2,7 @@ package app
 
 import (
 	"context"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"errors"
 	"path/filepath"
 	"strings"

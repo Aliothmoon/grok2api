@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"errors"
 	"strings"
 	"time"

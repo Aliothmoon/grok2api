@@ -3,7 +3,7 @@ package web
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"errors"
 	"fmt"
 	"io"

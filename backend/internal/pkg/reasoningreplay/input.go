@@ -1,7 +1,7 @@
 package reasoningreplay
 
 import (
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"strings"
 )
 

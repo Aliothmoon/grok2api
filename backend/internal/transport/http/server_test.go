@@ -2,7 +2,7 @@ package httpserver
 
 import (
 	"context"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"

@@ -3,7 +3,7 @@ package reasoningreplay
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"io"
 	"sort"
 	"strings"

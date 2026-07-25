@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1231,7 +1231,8 @@ func decodeDirectFileUploadResponse(source io.Reader) (uploadedFile, error) {
 		} `json:"fileMetadata"`
 	}
 	if err := json.NewDecoder(source).Decode(&value); err != nil {
-		return uploadedFile{}, fmt.Errorf("V2 上传文件响应无效: %w", err)
+		// Do not wrap codec diagnostics: they may embed the raw body (HTML error pages).
+		return uploadedFile{}, fmt.Errorf("V2 上传文件响应无效")
 	}
 	if value.FileMetadata.ID == "" {
 		value.FileMetadata.ID = value.FileMetadata.FileID
@@ -1293,7 +1294,8 @@ func decodeLegacyFileUploadResponse(statusCode int, body []byte) (uploadedFile, 
 		FileURI        string `json:"fileUri"`
 	}
 	if err := json.Unmarshal(body, &value); err != nil {
-		return uploadedFile{}, fmt.Errorf("上传文件响应无效: %w", err)
+		// Do not wrap codec diagnostics: they may embed the raw body (HTML error pages).
+		return uploadedFile{}, fmt.Errorf("上传文件响应无效")
 	}
 	if value.FileMetadataID == "" {
 		value.FileMetadataID = value.FileID

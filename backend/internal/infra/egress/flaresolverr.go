@@ -3,7 +3,7 @@ package egress
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"errors"
 	"fmt"
 	"io"

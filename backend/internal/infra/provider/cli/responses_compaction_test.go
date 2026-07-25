@@ -2,7 +2,7 @@ package cli
 
 import (
 	"encoding/base64"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"errors"
 	"io"
 	"net/http"

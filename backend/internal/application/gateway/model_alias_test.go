@@ -1,7 +1,7 @@
 package gateway
 
 import (
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"testing"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"

@@ -2,7 +2,7 @@ package relational
 
 import (
 	"context"
-	"encoding/json"
+	"github.com/chenyme/grok2api/backend/internal/pkg/json"
 	"os"
 	"path/filepath"
 	"testing"
