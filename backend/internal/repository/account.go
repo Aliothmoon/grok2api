@@ -31,6 +31,12 @@ type RoutingLayerRepository interface {
 	ListRoutingAccountOverlays(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel string) (account.RoutingOverlaySnapshot, error)
 }
 
+// RoutingAccountLookup loads a single account's routing projection without the full enabled pool.
+type RoutingAccountLookup interface {
+	GetRoutingAccountBase(ctx context.Context, id uint64, quotaMode string) (account.RoutingAccountBase, error)
+	GetRoutingCandidate(ctx context.Context, id uint64, modelRouteID uint64, upstreamModel, quotaMode string) (account.RoutingCandidate, error)
+}
+
 // AccountRepository 定义 OAuth 账号和额度快照持久化能力。
 type AccountRepository interface {
 	List(ctx context.Context, query AccountListQuery) ([]account.Credential, int64, error)

@@ -188,8 +188,9 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 }
 
 // ListRoutingCandidates 批量加载账号、额度、恢复状态和目标模型能力，避免推理热路径按账号逐条查询。
+// 返回的 Credential 为路由投影，不含加密 token 字段。
 func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error) {
-	values, err := r.ListEnabled(ctx, provider)
+	bases, err := r.ListRoutingAccountBases(ctx, provider, quotaMode)
 	if err != nil {
 		return nil, err
 	}
@@ -203,45 +204,18 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 			for _, id := range boundIDs {
 				bound[id] = true
 			}
-			filtered := values[:0]
-			for _, value := range values {
-				if bound[value.ID] {
-					filtered = append(filtered, value)
+			filtered := bases[:0]
+			for _, base := range bases {
+				if bound[base.Credential.ID] {
+					filtered = append(filtered, base)
 				}
 			}
-			values = filtered
+			bases = filtered
 		}
 	}
-	ids := make([]uint64, 0, len(values))
-	for _, value := range values {
-		ids = append(ids, value.ID)
-	}
-	billings, err := r.GetBillings(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-	recoveries, err := r.GetQuotaRecoveries(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-	quotaWindows := make(map[uint64]account.QuotaWindow, len(ids))
-	if len(ids) > 0 && (provider == account.ProviderWeb || quotaMode != "") {
-		var rows []quotaWindowModel
-		modes := make([]string, 0, 2)
-		if provider == account.ProviderWeb {
-			modes = append(modes, "weekly")
-		}
-		if quotaMode != "" {
-			modes = append(modes, quotaMode)
-		}
-		if err := r.db.db.WithContext(ctx).Where("account_id IN ? AND mode IN ?", ids, modes).Order("CASE WHEN mode = 'weekly' THEN 0 ELSE 1 END").Find(&rows).Error; err != nil {
-			return nil, err
-		}
-		for _, row := range rows {
-			if _, exists := quotaWindows[row.AccountID]; !exists {
-				quotaWindows[row.AccountID] = toQuotaWindowDomain(row)
-			}
-		}
+	ids := make([]uint64, 0, len(bases))
+	for _, base := range bases {
+		ids = append(ids, base.Credential.ID)
 	}
 	known := make(map[uint64]bool, len(ids))
 	supported := make(map[uint64]bool, len(ids))
@@ -271,45 +245,29 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 	}
 	sharedSuperBuildModel := false
 	if provider == account.ProviderBuild && len(bound) == 0 {
-		for _, value := range values {
-			if !supported[value.ID] {
+		for _, base := range bases {
+			if !supported[base.Credential.ID] {
 				continue
 			}
-			var billing *account.Billing
-			if snapshot, exists := billings[value.ID]; exists {
-				billing = &snapshot
-			}
-			if account.IsBuildSuper(value, billing) {
+			if account.IsBuildSuper(base.Credential, base.Billing) {
 				sharedSuperBuildModel = true
 				break
 			}
 		}
 	}
-	result := make([]account.RoutingCandidate, 0, len(values))
-	for _, value := range values {
-		capabilityKnown, supportsModel := known[value.ID], supported[value.ID]
+	result := make([]account.RoutingCandidate, 0, len(bases))
+	for _, base := range bases {
+		capabilityKnown, supportsModel := known[base.Credential.ID], supported[base.Credential.ID]
 		if len(bound) > 0 {
 			capabilityKnown, supportsModel = true, true
-		} else if sharedSuperBuildModel {
-			var billing *account.Billing
-			if snapshot, exists := billings[value.ID]; exists {
-				billing = &snapshot
-			}
-			if account.IsBuildSuper(value, billing) {
-				capabilityKnown, supportsModel = true, true
-			}
+		} else if sharedSuperBuildModel && account.IsBuildSuper(base.Credential, base.Billing) {
+			capabilityKnown, supportsModel = true, true
 		}
-		candidate := account.RoutingCandidate{Credential: value, ModelCapabilityKnown: capabilityKnown, SupportsModel: supportsModel}
-		if billing, ok := billings[value.ID]; ok {
-			candidate.Billing = &billing
+		candidate := account.RoutingCandidate{
+			Credential: base.Credential, Billing: base.Billing, QuotaRecovery: base.QuotaRecovery, QuotaWindow: base.QuotaWindow,
+			ModelCapabilityKnown: capabilityKnown, SupportsModel: supportsModel,
 		}
-		if recovery, ok := recoveries[value.ID]; ok {
-			candidate.QuotaRecovery = &recovery
-		}
-		if window, ok := quotaWindows[value.ID]; ok {
-			candidate.QuotaWindow = &window
-		}
-		if block, ok := modelQuotaBlocks[value.ID]; ok {
+		if block, ok := modelQuotaBlocks[base.Credential.ID]; ok {
 			candidate.ModelQuotaBlock = &block
 		}
 		result = append(result, candidate)
@@ -317,10 +275,115 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 	return result, nil
 }
 
+// ListRoutingAccountBases loads provider-level routing projections without encrypted tokens.
 func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provider account.Provider, quotaMode string) ([]account.RoutingAccountBase, error) {
-	values, err := r.ListEnabled(ctx, provider)
+	values, err := r.listEnabledRoutingProjections(ctx, provider)
 	if err != nil {
 		return nil, err
+	}
+	return r.attachRoutingBaseAttachments(ctx, values, quotaMode)
+}
+
+// GetRoutingAccountBase loads one account's routing base projection without scanning the full pool.
+func (r *AccountRepository) GetRoutingAccountBase(ctx context.Context, id uint64, quotaMode string) (account.RoutingAccountBase, error) {
+	value, err := r.getRoutingProjection(ctx, id)
+	if err != nil {
+		return account.RoutingAccountBase{}, err
+	}
+	bases, err := r.attachRoutingBaseAttachments(ctx, []account.Credential{value}, quotaMode)
+	if err != nil {
+		return account.RoutingAccountBase{}, err
+	}
+	if len(bases) == 0 {
+		return account.RoutingAccountBase{}, repository.ErrNotFound
+	}
+	return bases[0], nil
+}
+
+// GetRoutingCandidate loads one account's routing candidate without scanning the full enabled pool.
+func (r *AccountRepository) GetRoutingCandidate(ctx context.Context, id uint64, modelRouteID uint64, upstreamModel, quotaMode string) (account.RoutingCandidate, error) {
+	base, err := r.GetRoutingAccountBase(ctx, id, quotaMode)
+	if err != nil {
+		return account.RoutingCandidate{}, err
+	}
+	candidate := account.RoutingCandidate{Credential: base.Credential, Billing: base.Billing, QuotaRecovery: base.QuotaRecovery, QuotaWindow: base.QuotaWindow}
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if upstreamModel == "" {
+		return candidate, nil
+	}
+	boundIDs, loadErr := r.listRoutingBoundAccountIDs(ctx, base.Credential.Provider, modelRouteID, upstreamModel)
+	if loadErr != nil {
+		return account.RoutingCandidate{}, loadErr
+	}
+	if len(boundIDs) > 0 {
+		bound := false
+		for _, boundID := range boundIDs {
+			if boundID == id {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			return account.RoutingCandidate{}, repository.ErrNotFound
+		}
+		candidate.ModelCapabilityKnown = true
+		candidate.SupportsModel = true
+	} else {
+		var stateCount int64
+		if err := r.db.db.WithContext(ctx).Model(&accountModelSyncStateModel{}).Where("account_id = ? AND last_success_at IS NOT NULL", id).Count(&stateCount).Error; err != nil {
+			return account.RoutingCandidate{}, err
+		}
+		candidate.ModelCapabilityKnown = stateCount > 0
+		var capabilityCount int64
+		if err := r.db.db.WithContext(ctx).Model(&accountModelCapabilityModel{}).Where("account_id = ? AND upstream_model = ?", id, upstreamModel).Count(&capabilityCount).Error; err != nil {
+			return account.RoutingCandidate{}, err
+		}
+		candidate.SupportsModel = capabilityCount > 0
+	}
+	var blockRows []accountModelQuotaBlockModel
+	if err := r.db.db.WithContext(ctx).Where("account_id = ? AND upstream_model = ? AND cooldown_until > ?", id, upstreamModel, time.Now().UTC()).Find(&blockRows).Error; err != nil {
+		return account.RoutingCandidate{}, err
+	}
+	if len(blockRows) > 0 {
+		row := blockRows[0]
+		candidate.ModelQuotaBlock = &account.ModelQuotaBlock{AccountID: row.AccountID, UpstreamModel: row.UpstreamModel, Reason: row.Reason, CooldownUntil: row.CooldownUntil.UTC(), UpdatedAt: row.UpdatedAt.UTC()}
+	}
+	return candidate, nil
+}
+
+func (r *AccountRepository) listEnabledRoutingProjections(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
+	var rows []accountModel
+	// Routing projection intentionally omits account_credentials encrypted columns.
+	err := r.db.db.WithContext(ctx).Preload("WebProfile").Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).Order("priority DESC, id ASC").Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]account.Credential, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, account.StripRoutingSecrets(toAccountDomain(row)))
+	}
+	if err := r.attachRoutingEgressIdentities(ctx, provider, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (r *AccountRepository) getRoutingProjection(ctx context.Context, id uint64) (account.Credential, error) {
+	var row accountModel
+	if err := r.db.db.WithContext(ctx).Preload("WebProfile").First(&row, id).Error; err != nil {
+		return account.Credential{}, mapError(err)
+	}
+	value := account.StripRoutingSecrets(toAccountDomain(row))
+	values := []account.Credential{value}
+	if err := r.attachRoutingEgressIdentities(ctx, value.Provider, values); err != nil {
+		return account.Credential{}, err
+	}
+	return values[0], nil
+}
+
+func (r *AccountRepository) attachRoutingBaseAttachments(ctx context.Context, values []account.Credential, quotaMode string) ([]account.RoutingAccountBase, error) {
+	if len(values) == 0 {
+		return []account.RoutingAccountBase{}, nil
 	}
 	ids := make([]uint64, 0, len(values))
 	for _, value := range values {
@@ -335,6 +398,7 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 		return nil, err
 	}
 	quotaWindows := make(map[uint64]account.QuotaWindow, len(ids))
+	provider := values[0].Provider
 	if len(ids) > 0 && (provider == account.ProviderWeb || quotaMode != "") {
 		modes := make([]string, 0, 2)
 		if provider == account.ProviderWeb {
@@ -355,7 +419,7 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 	}
 	result := make([]account.RoutingAccountBase, 0, len(values))
 	for _, value := range values {
-		base := account.RoutingAccountBase{Credential: value}
+		base := account.RoutingAccountBase{Credential: account.StripRoutingSecrets(value)}
 		if billing, ok := billings[value.ID]; ok {
 			base.Billing = &billing
 		}

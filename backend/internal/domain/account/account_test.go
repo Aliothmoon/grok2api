@@ -81,6 +81,26 @@ func TestIsBuildSuper(t *testing.T) {
 	}
 }
 
+func TestStripRoutingSecretsAndHasRoutingSecrets(t *testing.T) {
+	value := Credential{
+		ID: 7, EncryptedAccessToken: "access", EncryptedRefreshToken: "refresh", EncryptedCloudflareCookie: "cf",
+		Name: "n", Priority: 3,
+	}
+	if !HasRoutingSecrets(value) {
+		t.Fatal("expected secrets present")
+	}
+	stripped := StripRoutingSecrets(value)
+	if HasRoutingSecrets(stripped) {
+		t.Fatalf("secrets remain: %#v", stripped)
+	}
+	if stripped.ID != 7 || stripped.Name != "n" || stripped.Priority != 3 {
+		t.Fatalf("identity fields lost: %#v", stripped)
+	}
+	if value.EncryptedAccessToken == "" {
+		t.Fatal("StripRoutingSecrets mutated original")
+	}
+}
+
 func TestRoutingCandidateIsKnownFreeBuild(t *testing.T) {
 	freeBilling := Billing{PlanName: "Free"}
 	paidBilling := Billing{PlanName: "SuperGrok"}

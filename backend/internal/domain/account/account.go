@@ -342,6 +342,8 @@ type QuotaRecovery struct {
 }
 
 // RoutingCandidate 聚合账号选择热路径所需的持久化快照。
+// Credential 在热路径上为路由投影：不含 access/refresh/cloudflare 等加密 token。
+// 上游调用前必须通过 Get / EnsureCredential 加载完整凭据。
 type RoutingCandidate struct {
 	Credential           Credential
 	Billing              *Billing
@@ -353,12 +355,25 @@ type RoutingCandidate struct {
 }
 
 // RoutingAccountBase contains provider-level routing state reusable across
-// models. Credentials remain encrypted until the provider adapter uses them.
+// models. Credential is a routing projection without encrypted token material.
 type RoutingAccountBase struct {
 	Credential    Credential
 	Billing       *Billing
 	QuotaRecovery *QuotaRecovery
 	QuotaWindow   *QuotaWindow
+}
+
+// StripRoutingSecrets clears encrypted credential material from a routing projection.
+func StripRoutingSecrets(value Credential) Credential {
+	value.EncryptedAccessToken = ""
+	value.EncryptedRefreshToken = ""
+	value.EncryptedCloudflareCookie = ""
+	return value
+}
+
+// HasRoutingSecrets reports whether a credential still carries encrypted secrets.
+func HasRoutingSecrets(value Credential) bool {
+	return value.EncryptedAccessToken != "" || value.EncryptedRefreshToken != "" || value.EncryptedCloudflareCookie != ""
 }
 
 // RoutingAccountOverlay contains model-specific eligibility state.

@@ -1715,6 +1715,15 @@ func (s *Service) EnsureCredential(ctx context.Context, value accountdomain.Cred
 }
 
 func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Credential, force, bypassCooldown, respectSchedule bool) (accountdomain.Credential, error) {
+	// Selection returns routing projections without encrypted tokens. Hydrate secrets
+	// before any non-refresh return path (SSO web/console) or refresh decision.
+	if value.ID != 0 && value.EncryptedAccessToken == "" && value.EncryptedRefreshToken == "" {
+		latest, err := s.accounts.Get(ctx, value.ID)
+		if err != nil {
+			return accountdomain.Credential{}, err
+		}
+		value = latest
+	}
 	if s.providers == nil || !s.providers.SupportsCredentialRefresh(value.Provider) {
 		if force {
 			return accountdomain.Credential{}, ErrUnsupported
