@@ -339,6 +339,23 @@ func (r *AccountRepository) GetRoutingCandidate(ctx context.Context, id uint64, 
 			return account.RoutingCandidate{}, err
 		}
 		candidate.SupportsModel = capabilityCount > 0
+		// Build Super 共享模型语义：本账号无 capability 行时，若同一 provider 下任一 Super
+		// 账号支持该模型，则本 Super 账号也视为支持，与 ListRoutingCandidates 行为一致。
+		if !candidate.SupportsModel && base.Credential.Provider == account.ProviderBuild && account.IsBuildSuper(base.Credential, base.Billing) {
+			var superSupported int64
+			if err := r.db.db.WithContext(ctx).
+				Table("account_model_capabilities AS capability").
+				Joins("JOIN provider_accounts AS account ON account.id = capability.account_id").
+				Where("account.provider = ? AND capability.upstream_model = ?", account.ProviderBuild, upstreamModel).
+				Where("account.build_super_entitled = TRUE OR EXISTS (SELECT 1 FROM account_billing_snapshots billing WHERE billing.account_id = account.id AND ("+accountPaidBillingSignals+"))").
+				Count(&superSupported).Error; err != nil {
+				return account.RoutingCandidate{}, err
+			}
+			if superSupported > 0 {
+				candidate.SupportsModel = true
+				candidate.ModelCapabilityKnown = true
+			}
+		}
 	}
 	var blockRows []accountModelQuotaBlockModel
 	if err := r.db.db.WithContext(ctx).Where("account_id = ? AND upstream_model = ? AND cooldown_until > ?", id, upstreamModel, time.Now().UTC()).Find(&blockRows).Error; err != nil {
@@ -436,7 +453,9 @@ func (r *AccountRepository) attachRoutingBaseAttachments(ctx context.Context, va
 	}
 	result := make([]account.RoutingAccountBase, 0, len(values))
 	for _, value := range values {
-		base := account.RoutingAccountBase{Credential: account.StripRoutingSecrets(value)}
+		// listEnabledRoutingProjections already stripped secrets; keep this as a defensive
+		// guarantee for any future caller that passes unstripped credentials.
+		base := account.RoutingAccountBase{Credential: value}
 		if billing, ok := billings[value.ID]; ok {
 			base.Billing = &billing
 		}

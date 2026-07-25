@@ -124,6 +124,53 @@ func TestGetRoutingCandidateDoesNotScanFullPool(t *testing.T) {
 	}
 }
 
+func TestGetRoutingCandidateApplySharedSuperBuildModel(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "routing-super-shared.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := NewAccountRepository(database)
+	models := NewModelRepository(database)
+	// Super-entitled pinned account with no capability row of its own.
+	pinned, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "pinned-super", SourceKey: "pinned-super",
+		EncryptedAccessToken: "access", AuthStatus: account.AuthStatusActive, Enabled: true,
+		BuildSuperEntitled: true, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another Super account that does support the model.
+	other, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "other-super", SourceKey: "other-super",
+		EncryptedAccessToken: "access", AuthStatus: account.AuthStatusActive, Enabled: true,
+		BuildSuperEntitled: true, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := models.ReplaceAccountCapabilities(ctx, other.ID, []string{"grok-super-shared"}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	candidate, err := accounts.GetRoutingCandidate(ctx, pinned.ID, 0, "grok-super-shared", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !candidate.SupportsModel || !candidate.ModelCapabilityKnown {
+		t.Fatalf("Super shared model not applied to pinned candidate: %#v", candidate)
+	}
+	if account.HasRoutingSecrets(candidate.Credential) {
+		t.Fatalf("pinned candidate leaked secrets: %#v", candidate.Credential)
+	}
+}
+
 func TestGetRoutingCandidateRespectsRouteBinding(t *testing.T) {
 	ctx := context.Background()
 	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "routing-bound.db"))
