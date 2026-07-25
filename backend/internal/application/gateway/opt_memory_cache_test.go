@@ -252,6 +252,83 @@ func TestAccountScopedBasePatchKeepsL3FreshForSubsequentHit(t *testing.T) {
 	}
 }
 
+func TestAccountCapabilitySyncDoesNotClearWholeProviderOverlay(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "cap-sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inner := relational.NewAccountRepository(database)
+	counting := &overlayCountingRepo{countingListBasesRepo: wrapCountingBases(inner)}
+
+	a1, _, err := inner.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "a1", SourceKey: "a1",
+		EncryptedAccessToken: "a", AuthStatus: account.AuthStatusActive, Enabled: true, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := inner.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "a2", SourceKey: "a2",
+		EncryptedAccessToken: "a", AuthStatus: account.AuthStatusActive, Enabled: true, Priority: 50, MaxConcurrent: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(counting, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	inner.SetInvalidationObserver(func(_ context.Context, event repository.InvalidationEvent) {
+		selector.ApplyInvalidation(event)
+	})
+
+	// Warm overlay + assembled for two models.
+	for _, m := range []string{"chat-model", "video-model"} {
+		if _, err := selector.loadCandidates(ctx, account.ProviderBuild, 0, m, "", time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	overlayLoadsWarm := counting.overlayLoads.Load()
+	assembledBefore := selector.CacheStats().Sizes.AssembledEntries
+	overlayBefore := selector.CacheStats().Sizes.OverlaySnapshots
+	if overlayBefore < 2 {
+		t.Fatalf("expected >=2 warm overlay snapshots, got %#v", selector.CacheStats().Sizes)
+	}
+
+	// Simulate the capability-sync event source: AccountID set, NO UpstreamModel.
+	// This used to clear the whole provider's overlays; it must now patch only a1.
+	selector.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountCapabilityChanged, Provider: account.ProviderBuild, AccountID: a1.ID,
+	})
+
+	stats := selector.CacheStats()
+	// Overlay snapshots for both models must survive (account-scoped patch, not provider clear).
+	if stats.Sizes.OverlaySnapshots < overlayBefore {
+		t.Fatalf("capability sync cleared overlay snapshots: before=%d after=%d", overlayBefore, stats.Sizes.OverlaySnapshots)
+	}
+	if stats.Sizes.AssembledEntries < assembledBefore {
+		t.Fatalf("capability sync cleared assembled: before=%d after=%d", assembledBefore, stats.Sizes.AssembledEntries)
+	}
+	if stats.Invalidation.OverlayPatches < 1 {
+		t.Fatalf("expected overlay patch counter: %#v", stats.Invalidation)
+	}
+	if stats.Invalidation.BulkRebuilds != 0 {
+		t.Fatalf("unexpected bulk rebuild: %#v", stats.Invalidation)
+	}
+
+	// Subsequent loads for the same models must hit warm overlay (no full-list reload).
+	for _, m := range []string{"chat-model", "video-model"} {
+		if _, err := selector.loadCandidates(ctx, account.ProviderBuild, 0, m, "", time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if counting.overlayLoads.Load() != overlayLoadsWarm {
+		t.Fatalf("capability-sync patch forced full overlay reload: warm=%d now=%d", overlayLoadsWarm, counting.overlayLoads.Load())
+	}
+}
+
 func TestModelScopedOverlayPatchDoesNotReloadFullModelOverlay(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "overlay-patch.db"))

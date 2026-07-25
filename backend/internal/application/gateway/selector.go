@@ -1172,7 +1172,11 @@ func (s *Selector) ApplyInvalidation(event repository.InvalidationEvent) {
 		s.patchBaseAccount(event)
 		return
 	}
-	if overlay && event.AccountID != 0 && event.UpstreamModel != "" && event.Layer() == repository.InvalidationLayerOverlay {
+	// Account-scoped overlay events (capability/model-quota/access-denied) patch that one
+	// account's overlay rows without clearing the whole provider. When UpstreamModel is known
+	// only that model is patched; otherwise the account is patched across every cached model
+	// for the provider (e.g. account capability sync replaces all its model rows).
+	if overlay && event.AccountID != 0 && event.Layer() == repository.InvalidationLayerOverlay {
 		s.patchOverlayAccount(event)
 		return
 	}
@@ -1372,8 +1376,10 @@ func (s *Selector) patchBaseAccount(event repository.InvalidationEvent) {
 	}
 }
 
-// patchOverlayAccount updates one account's overlay row for a known upstream model
-// without clearing the whole model snapshot when warm L2/L3 entries exist.
+// patchOverlayAccount updates one account's overlay rows without clearing whole
+// model/provider snapshots when warm L2/L3 entries exist. When UpstreamModel is known
+// only that model is patched; when it is empty (e.g. account capability sync) the account
+// is patched across every cached model for the provider.
 func (s *Selector) patchOverlayAccount(event repository.InvalidationEvent) {
 	s.cacheStats.overlayEvents.Add(1)
 	provider := event.Provider
@@ -1387,17 +1393,25 @@ func (s *Selector) patchOverlayAccount(event repository.InvalidationEvent) {
 	}
 
 	s.candidateMu.Lock()
-	overlayKeys := make([]routingOverlayCacheKey, 0, 4)
+	overlayKeys := make([]routingOverlayCacheKey, 0, 8)
 	for key := range s.routingOverlays {
-		if (provider == "" || key.provider == provider) && key.upstreamModel == upstreamModel {
-			overlayKeys = append(overlayKeys, key)
+		if provider != "" && key.provider != provider {
+			continue
 		}
+		if upstreamModel != "" && key.upstreamModel != upstreamModel {
+			continue
+		}
+		overlayKeys = append(overlayKeys, key)
 	}
-	assembledKeys := make([]candidateCacheKey, 0, 4)
+	assembledKeys := make([]candidateCacheKey, 0, 8)
 	for key := range s.candidates {
-		if (provider == "" || key.provider == provider) && key.upstreamModel == upstreamModel {
-			assembledKeys = append(assembledKeys, key)
+		if provider != "" && key.provider != provider {
+			continue
 		}
+		if upstreamModel != "" && key.upstreamModel != upstreamModel {
+			continue
+		}
+		assembledKeys = append(assembledKeys, key)
 	}
 	s.candidateMu.Unlock()
 
@@ -1416,14 +1430,15 @@ func (s *Selector) patchOverlayAccount(event repository.InvalidationEvent) {
 	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), routingBasePointLoadTimeout)
 	defer cancel()
 
-	// Collect point-loaded overlay fields per modelRouteID (and quotaMode for L3).
+	// Collect point-loaded overlay fields per cached key. Use the key's own upstream model
+	// so the no-model case still patches the right model row per snapshot.
 	type overlayPatch struct {
 		value account.RoutingAccountOverlay
 		drop  bool
 	}
 	overlayPatches := make(map[routingOverlayCacheKey]overlayPatch, len(overlayKeys))
 	for _, key := range overlayKeys {
-		candidate, err := lookup.GetRoutingCandidate(loadCtx, accountID, key.modelRouteID, upstreamModel, "")
+		candidate, err := lookup.GetRoutingCandidate(loadCtx, accountID, key.modelRouteID, key.upstreamModel, "")
 		if err != nil {
 			if errors.Is(err, repository.ErrNotFound) {
 				overlayPatches[key] = overlayPatch{drop: true}
@@ -1433,14 +1448,14 @@ func (s *Selector) patchOverlayAccount(event repository.InvalidationEvent) {
 			return
 		}
 		overlayPatches[key] = overlayPatch{value: account.RoutingAccountOverlay{
-			AccountID: accountID, Bound: true, ModelCapabilityKnown: candidate.ModelCapabilityKnown,
+			AccountID: accountID, Bound: snapHasBindings(s.routingOverlays, key), ModelCapabilityKnown: candidate.ModelCapabilityKnown,
 			SupportsModel: candidate.SupportsModel, ModelQuotaBlock: candidate.ModelQuotaBlock,
 		}}
 	}
 
 	assembledPatches := make(map[candidateCacheKey]*account.RoutingCandidate, len(assembledKeys))
 	for _, key := range assembledKeys {
-		candidate, err := lookup.GetRoutingCandidate(loadCtx, accountID, key.modelRouteID, upstreamModel, key.quotaMode)
+		candidate, err := lookup.GetRoutingCandidate(loadCtx, accountID, key.modelRouteID, key.upstreamModel, key.quotaMode)
 		if err != nil {
 			if errors.Is(err, repository.ErrNotFound) {
 				assembledPatches[key] = nil
@@ -1511,6 +1526,14 @@ func (s *Selector) patchOverlayAccount(event repository.InvalidationEvent) {
 	if changedAssembled {
 		s.cacheStats.assembledPatches.Add(1)
 	}
+}
+
+// snapHasBindings reports whether a warm overlay snapshot was loaded under model bindings.
+func snapHasBindings(overlays map[routingOverlayCacheKey]routingOverlaySnapshot, key routingOverlayCacheKey) bool {
+	if snap, ok := overlays[key]; ok {
+		return snap.value.HasBindings
+	}
+	return false
 }
 
 // bulkClearOverlayModel clears warm L2/L3 for a model (fail-open / no lookup).
