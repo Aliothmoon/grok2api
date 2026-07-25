@@ -351,10 +351,24 @@ func (r *AccountRepository) GetRoutingCandidate(ctx context.Context, id uint64, 
 	return candidate, nil
 }
 
+// routingCredentialPreload loads only non-secret credential metadata (auth type,
+// schedule fields). Encrypted token columns are never selected on the hot path.
+func routingCredentialPreload(db *gorm.DB) *gorm.DB {
+	return db.Select(
+		"account_id", "auth_type", "client_id",
+		"expires_at", "refresh_due_at", "last_refresh_at",
+		"refresh_failures", "last_refresh_error", "refresh_permanent", "updated_at",
+	)
+}
+
 func (r *AccountRepository) listEnabledRoutingProjections(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
 	var rows []accountModel
 	// Routing projection intentionally omits account_credentials encrypted columns.
-	err := r.db.db.WithContext(ctx).Preload("WebProfile").Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).Order("priority DESC, id ASC").Find(&rows).Error
+	err := r.db.db.WithContext(ctx).
+		Preload("Credential", routingCredentialPreload).
+		Preload("WebProfile").
+		Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).
+		Order("priority DESC, id ASC").Find(&rows).Error
 	if err != nil {
 		return nil, err
 	}
@@ -370,7 +384,10 @@ func (r *AccountRepository) listEnabledRoutingProjections(ctx context.Context, p
 
 func (r *AccountRepository) getRoutingProjection(ctx context.Context, id uint64) (account.Credential, error) {
 	var row accountModel
-	if err := r.db.db.WithContext(ctx).Preload("WebProfile").First(&row, id).Error; err != nil {
+	if err := r.db.db.WithContext(ctx).
+		Preload("Credential", routingCredentialPreload).
+		Preload("WebProfile").
+		First(&row, id).Error; err != nil {
 		return account.Credential{}, mapError(err)
 	}
 	value := account.StripRoutingSecrets(toAccountDomain(row))

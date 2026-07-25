@@ -8,14 +8,19 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/domain/model"
+	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -155,6 +160,77 @@ func TestVideoQueueIsBoundedAndDeduplicated(t *testing.T) {
 	if service.enqueueVideoJob("video_overflow") {
 		t.Fatal("queue accepted a job beyond its capacity")
 	}
+}
+
+func TestRunVideoJobHydratesProjectionBeforeGenerate(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-hydrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	sticky := memory.NewStickyStore()
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "video-web", SourceKey: "video-web",
+		EncryptedAccessToken: "video-sso-secret", Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, err := modelRepo.Create(ctx, model.Route{
+		PublicID: "video-model", Provider: account.ProviderWeb, UpstreamModel: "video-upstream",
+		Capability: model.CapabilityVideo, Enabled: true,
+	}, []uint64{credential.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &videoHydrateAdapter{}
+	registry := provider.NewRegistry(adapter)
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, nil, registry, selector, nil, 2)
+	service.mediaJobs = &videoUsageRepository{job: media.Job{ID: "video_hydrate", AccountID: credential.ID, Provider: string(account.ProviderWeb)}}
+	service.logger = slog.Default()
+
+	service.runVideoJob(ctx, media.Job{
+		ID: "video_hydrate", AccountID: credential.ID, Provider: string(account.ProviderWeb),
+		Prompt: "hello", Seconds: 4, Size: "1:1", Quality: "720p", InputJSON: `{}`,
+	}, route)
+
+	if adapter.generateCalls != 1 {
+		t.Fatalf("generateCalls = %d", adapter.generateCalls)
+	}
+	if adapter.lastAccessToken != "video-sso-secret" {
+		t.Fatalf("GenerateVideo received empty/wrong token %q", adapter.lastAccessToken)
+	}
+	if adapter.lastAuthType != account.AuthTypeSSO {
+		t.Fatalf("GenerateVideo auth type = %q", adapter.lastAuthType)
+	}
+}
+
+type videoHydrateAdapter struct {
+	generateCalls   int
+	lastAccessToken string
+	lastAuthType    account.AuthType
+}
+
+func (a *videoHydrateAdapter) Provider() account.Provider { return account.ProviderWeb }
+
+func (a *videoHydrateAdapter) GenerateVideo(_ context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+	a.generateCalls++
+	a.lastAccessToken = request.Credential.EncryptedAccessToken
+	a.lastAuthType = request.Credential.AuthType
+	return provider.VideoResult{URL: "https://example.test/video.mp4", ContentType: "video/mp4", AssetID: "asset-local"}, nil
+}
+
+func (a *videoHydrateAdapter) DownloadVideo(context.Context, account.Credential, string) (io.ReadCloser, string, int64, error) {
+	return nil, "", 0, errors.New("not used")
 }
 
 func TestPersistRemoteVideoRetriesSameResultWithoutRegeneration(t *testing.T) {

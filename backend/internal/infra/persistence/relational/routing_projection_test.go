@@ -52,6 +52,9 @@ func TestListRoutingAccountBasesExcludesEncryptedTokens(t *testing.T) {
 	if bases[0].Credential.ID != created.ID || bases[0].Credential.Priority != 10 {
 		t.Fatalf("routing projection missing identity fields: %#v", bases[0].Credential)
 	}
+	if bases[0].Credential.AuthType != account.AuthTypeOAuth {
+		t.Fatalf("routing projection missing auth type: %#v", bases[0].Credential)
+	}
 
 	candidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderBuild, 0, "model-a", "")
 	if err != nil {

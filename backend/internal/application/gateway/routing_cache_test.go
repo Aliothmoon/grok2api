@@ -150,8 +150,8 @@ func TestSelectorWriteAfterReadQuotaRecoveryEligibility(t *testing.T) {
 		selector.ApplyInvalidation(event)
 	})
 
-	// Warm cache with both accounts eligible.
-	if _, err := selector.Acquire(ctx, account.ProviderBuild, 0, "model", "", "", nil, false); err != nil {
+	// Warm cache without holding a concurrency lease (primary MaxConcurrent=1).
+	if _, err := selector.loadCandidates(ctx, account.ProviderBuild, 0, "model", "", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -174,6 +174,10 @@ func TestSelectorWriteAfterReadQuotaRecoveryEligibility(t *testing.T) {
 	}
 	if lease.Credential.ID != backup.ID {
 		t.Fatalf("after quota exhaust selection = %d want %d", lease.Credential.ID, backup.ID)
+	}
+	// Primary must be filtered by recovery eligibility, not only concurrency saturation.
+	if lease.Credential.ID == primary.ID {
+		t.Fatalf("primary still selected after quota recovery exhausted")
 	}
 	lease.Release()
 }
@@ -222,6 +226,42 @@ func TestSelectorWriteAfterReadDisableEligibility(t *testing.T) {
 		t.Fatalf("after disable selection = %d want %d", lease.Credential.ID, backup.ID)
 	}
 	lease.Release()
+}
+
+func TestRoutingProjectionKeepsAuthTypeWithoutSecrets(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "auth-type-projection.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	created, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, Name: "web-sso", SourceKey: "web-sso",
+		AuthType: account.AuthTypeSSO, EncryptedAccessToken: "sso-secret",
+		AuthStatus: account.AuthStatusActive, Enabled: true, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	lease, err := selector.Acquire(ctx, account.ProviderWeb, 0, "model", "weekly", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != created.ID {
+		t.Fatalf("selected = %d", lease.Credential.ID)
+	}
+	if lease.Credential.AuthType != account.AuthTypeSSO {
+		t.Fatalf("auth type missing on projection: %#v", lease.Credential)
+	}
+	if account.HasRoutingSecrets(lease.Credential) {
+		t.Fatalf("secrets leaked on projection: %#v", lease.Credential)
+	}
 }
 
 func TestAcquirePinnedUsesPointLookupWithoutFullPool(t *testing.T) {
