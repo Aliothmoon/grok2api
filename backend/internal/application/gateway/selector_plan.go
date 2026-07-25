@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -107,24 +108,25 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 	}
 	inFlight := make([]int, length)
 	if concurrencyHints == nil {
-		keys := make([]string, length)
+		ids := make([]uint64, length)
 		for position := range length {
 			index := position
 			if indexes != nil {
 				index = indexes[position]
 			}
-			keys[position] = accountConcurrencyKey(values[index].Credential.ID)
+			ids[position] = values[index].Credential.ID
 		}
-		concurrencySnapshot, err := s.loadConcurrencySnapshot(ctx, keys)
+		concurrencySnapshot, err := s.loadConcurrencySnapshotByAccountIDs(ctx, ids)
 		if err != nil {
 			return nil, err
 		}
 		for position := range length {
-			inFlight[position] = concurrencySnapshot[keys[position]]
+			// Sparse map: missing id ⇒ 0.
+			inFlight[position] = concurrencySnapshot[ids[position]]
 		}
 	} else {
 		missingIndexes := make([]int, 0, length)
-		keys := make([]string, 0, length)
+		ids := make([]uint64, 0, length)
 		for position := range length {
 			index := position
 			if indexes != nil {
@@ -134,15 +136,16 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 				continue
 			}
 			missingIndexes = append(missingIndexes, index)
-			keys = append(keys, accountConcurrencyKey(values[index].Credential.ID))
+			ids = append(ids, values[index].Credential.ID)
 		}
-		if len(keys) > 0 {
-			concurrencySnapshot, err := s.loadConcurrencySnapshot(ctx, keys)
+		if len(ids) > 0 {
+			concurrencySnapshot, err := s.loadConcurrencySnapshotByAccountIDs(ctx, ids)
 			if err != nil {
 				return nil, err
 			}
 			for position, index := range missingIndexes {
-				concurrencyHints[index] = concurrencySnapshot[keys[position]] + 1
+				// Sparse map: missing id ⇒ 0; store count+1 so 0 occupancy is distinguishable from unset.
+				concurrencyHints[index] = concurrencySnapshot[ids[position]] + 1
 			}
 		}
 		for position := range length {
@@ -179,15 +182,31 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 	return plan, nil
 }
 
-// loadConcurrencySnapshot 在极短窗口内合并相同候选池的并发快照读取。
-// 快照只参与排序，最终容量仍由原子 Acquire 校验，因此陈旧快照不会突破账号并发上限。
-func (s *Selector) loadConcurrencySnapshot(ctx context.Context, keys []string) (map[string]int, error) {
-	cacheKey := concurrencySnapshotKey(keys)
-	load := func() (map[string]int, error) {
-		values := make(map[string]int, len(keys))
+// loadConcurrencySnapshotByAccountIDs merges identical account-id batches briefly.
+// Snapshot is sort-only; atomic Acquire remains the capacity authority.
+// Returned map is sparse (only count>0); missing ids mean 0.
+func (s *Selector) loadConcurrencySnapshotByAccountIDs(ctx context.Context, accountIDs []uint64) (map[uint64]int, error) {
+	cacheKey := concurrencyAccountSnapshotKey(accountIDs)
+	load := func() (map[uint64]int, error) {
+		if accountReader, ok := s.concurrency.(repository.AccountConcurrencySnapshotReader); ok {
+			values, err := accountReader.CurrentManyAccountIDs(ctx, accountIDs)
+			if err != nil {
+				return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
+			}
+			if values == nil {
+				values = map[uint64]int{}
+			}
+			return values, nil
+		}
+		// Fallback: string-key bulk read, then sparsify by account id.
+		keys := make([]string, len(accountIDs))
+		for index, id := range accountIDs {
+			keys[index] = accountConcurrencyKey(id)
+		}
+		dense := make(map[string]int, len(keys))
 		if batchReader, ok := s.concurrency.(repository.ConcurrencySnapshotReader); ok {
 			var err error
-			values, err = batchReader.CurrentMany(ctx, keys)
+			dense, err = batchReader.CurrentMany(ctx, keys)
 			if err != nil {
 				return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
 			}
@@ -197,7 +216,15 @@ func (s *Selector) loadConcurrencySnapshot(ctx context.Context, keys []string) (
 				if err != nil {
 					return nil, fmt.Errorf("读取账号并发租约: %w", err)
 				}
-				values[key] = current
+				if current > 0 {
+					dense[key] = current
+				}
+			}
+		}
+		values := make(map[uint64]int)
+		for index, key := range keys {
+			if count := dense[key]; count > 0 {
+				values[accountIDs[index]] = count
 			}
 		}
 		return values, nil
@@ -209,12 +236,12 @@ func (s *Selector) loadConcurrencySnapshot(ctx context.Context, keys []string) (
 	return s.concurrencySnapshots.Load(ctx, cacheKey, time.Now(), load)
 }
 
-func concurrencySnapshotKey(keys []string) [32]byte {
+func concurrencyAccountSnapshotKey(accountIDs []uint64) [32]byte {
 	hash := sha256.New()
-	separator := []byte{0}
-	for _, key := range keys {
-		_, _ = hash.Write([]byte(key))
-		_, _ = hash.Write(separator)
+	var buf [8]byte
+	for _, id := range accountIDs {
+		binary.LittleEndian.PutUint64(buf[:], id)
+		_, _ = hash.Write(buf[:])
 	}
 	var result [32]byte
 	copy(result[:], hash.Sum(nil))

@@ -476,6 +476,28 @@ func (s *Store) CurrentMany(ctx context.Context, keys []string) (map[string]int,
 	return values, nil
 }
 
+// CurrentManyAccountIDs returns only nonzero account lease counts (sparse).
+func (s *Store) CurrentManyAccountIDs(ctx context.Context, accountIDs []uint64) (map[uint64]int, error) {
+	if len(accountIDs) == 0 {
+		return map[uint64]int{}, nil
+	}
+	keys := make([]string, len(accountIDs))
+	for index, id := range accountIDs {
+		keys[index] = repository.AccountConcurrencyKey(id)
+	}
+	dense, err := s.CurrentMany(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	values := make(map[uint64]int)
+	for index, key := range keys {
+		if count := dense[key]; count > 0 {
+			values[accountIDs[index]] = count
+		}
+	}
+	return values, nil
+}
+
 func (s *Store) Get(ctx context.Context, key string, now time.Time) (uint64, bool, error) {
 	value, err := s.client.Get(ctx, s.key("sticky", key)).Result()
 	if errors.Is(err, redisclient.Nil) {
@@ -810,6 +832,9 @@ func (l *ConcurrencyLimiter) Current(ctx context.Context, key string) (int, erro
 }
 func (l *ConcurrencyLimiter) CurrentMany(ctx context.Context, keys []string) (map[string]int, error) {
 	return l.store.CurrentMany(ctx, keys)
+}
+func (l *ConcurrencyLimiter) CurrentManyAccountIDs(ctx context.Context, accountIDs []uint64) (map[uint64]int, error) {
+	return l.store.CurrentManyAccountIDs(ctx, accountIDs)
 }
 
 // LockStore 适配 DistributedLock。

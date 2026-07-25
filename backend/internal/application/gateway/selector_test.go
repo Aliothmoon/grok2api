@@ -893,6 +893,18 @@ func (l *batchConcurrencyLimiter) CurrentMany(_ context.Context, keys []string) 
 	return values, nil
 }
 
+func (l *batchConcurrencyLimiter) CurrentManyAccountIDs(_ context.Context, accountIDs []uint64) (map[uint64]int, error) {
+	l.batchCalls++
+	values := make(map[uint64]int)
+	for _, id := range accountIDs {
+		key := repository.AccountConcurrencyKey(id)
+		if count := l.values[key]; count > 0 {
+			values[id] = count
+		}
+	}
+	return values, nil
+}
+
 type staticTierOrder struct{ order []account.WebTier }
 
 func (value staticTierOrder) TierOrder(account.Provider, string) []account.WebTier {

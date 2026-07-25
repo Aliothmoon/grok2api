@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
 func TestRateAndConcurrencyLimits(t *testing.T) {
@@ -35,6 +36,58 @@ func TestRateAndConcurrencyLimits(t *testing.T) {
 	values, err := concurrency.CurrentMany(ctx, []string{"key", "missing"})
 	if err != nil || values["key"] != 1 || values["missing"] != 0 {
 		t.Fatalf("并发快照 = %#v, err = %v", values, err)
+	}
+}
+
+func TestCurrentManyAccountIDsSparseEqualsDense(t *testing.T) {
+	ctx := context.Background()
+	limiter := NewConcurrencyLimiter()
+	// Occupy accounts 1 and 3 only.
+	r1, ok, err := limiter.Acquire(ctx, repository.AccountConcurrencyKey(1), 2)
+	if err != nil || !ok {
+		t.Fatalf("acquire 1: ok=%v err=%v", ok, err)
+	}
+	defer r1()
+	r1b, ok, err := limiter.Acquire(ctx, repository.AccountConcurrencyKey(1), 2)
+	if err != nil || !ok {
+		t.Fatalf("acquire 1b: ok=%v err=%v", ok, err)
+	}
+	defer r1b()
+	r3, ok, err := limiter.Acquire(ctx, repository.AccountConcurrencyKey(3), 1)
+	if err != nil || !ok {
+		t.Fatalf("acquire 3: ok=%v err=%v", ok, err)
+	}
+	defer r3()
+
+	ids := []uint64{1, 2, 3, 4, 5}
+	keys := make([]string, len(ids))
+	for i, id := range ids {
+		keys[i] = repository.AccountConcurrencyKey(id)
+	}
+	dense, err := limiter.CurrentMany(ctx, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sparse, err := limiter.CurrentManyAccountIDs(ctx, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sparse must omit zeros.
+	if _, ok := sparse[2]; ok {
+		t.Fatalf("sparse should omit zero id 2: %#v", sparse)
+	}
+	if _, ok := sparse[4]; ok {
+		t.Fatalf("sparse should omit zero id 4: %#v", sparse)
+	}
+	if sparse[1] != 2 || sparse[3] != 1 {
+		t.Fatalf("sparse nonzero = %#v", sparse)
+	}
+	for _, id := range ids {
+		want := dense[repository.AccountConcurrencyKey(id)]
+		got := sparse[id] // missing ⇒ 0
+		if got != want {
+			t.Fatalf("id %d sparse=%d dense=%d", id, got, want)
+		}
 	}
 }
 

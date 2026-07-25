@@ -184,6 +184,59 @@ func (l *ConcurrencyLimiter) CurrentMany(_ context.Context, keys []string) (map[
 	return values, nil
 }
 
+// CurrentManyAccountIDs returns only nonzero account lease counts (sparse).
+// Missing ids are treated as 0 by callers. Used by the selection hot path.
+func (l *ConcurrencyLimiter) CurrentManyAccountIDs(_ context.Context, accountIDs []uint64) (map[uint64]int, error) {
+	if len(accountIDs) == 0 {
+		return map[uint64]int{}, nil
+	}
+	// Sparse: only store count>0. Capacity hint is a soft upper bound, not dense size.
+	values := make(map[uint64]int)
+	var counts [shardCount]int
+	keys := make([]string, len(accountIDs))
+	for index, id := range accountIDs {
+		key := repository.AccountConcurrencyKey(id)
+		keys[index] = key
+		counts[shardIndex(key)]++
+	}
+	var offsets [shardCount + 1]int
+	for index := range shardCount {
+		offsets[index+1] = offsets[index] + counts[index]
+	}
+	cursors := offsets
+	grouped := l.indicesCache.Get().([]int)
+	if cap(grouped) < len(accountIDs) {
+		grouped = make([]int, len(accountIDs))
+	} else {
+		grouped = grouped[:len(accountIDs)]
+	}
+	defer func() {
+		if cap(grouped) <= maxEntries {
+			l.indicesCache.Put(grouped[:0])
+		}
+	}()
+	for idIndex, key := range keys {
+		shard := int(shardIndex(key))
+		grouped[cursors[shard]] = idIndex
+		cursors[shard]++
+	}
+	for shardIndex := range shardCount {
+		if offsets[shardIndex] == offsets[shardIndex+1] {
+			continue
+		}
+		shard := &l.shards[shardIndex]
+		shard.mu.Lock()
+		for _, idIndex := range grouped[offsets[shardIndex]:offsets[shardIndex+1]] {
+			key := keys[idIndex]
+			if count := shard.counts[key]; count > 0 {
+				values[accountIDs[idIndex]] = count
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return values, nil
+}
+
 type stickyBinding struct {
 	accountID uint64
 	expiresAt time.Time

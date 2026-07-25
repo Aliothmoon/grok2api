@@ -187,7 +187,7 @@ type Selector struct {
 	baseProviderVersion    map[account.Provider]uint64
 	overlayProviderVersion map[account.Provider]uint64
 	candidateLoads         singleflight.Group
-	concurrencySnapshots   *resultcache.Cache[[32]byte, map[string]int]
+	concurrencySnapshots   *resultcache.Cache[[32]byte, map[uint64]int]
 	cacheStats             routingCacheStats
 	tierOrders             interface {
 		TierOrder(account.Provider, string) []account.WebTier
@@ -196,24 +196,26 @@ type Selector struct {
 
 // RoutingCacheLayerStats is a snapshot of hit/miss/load counters for one cache layer.
 type RoutingCacheLayerStats struct {
-	Hits    uint64  `json:"hits"`
-	Misses  uint64  `json:"misses"`
-	Loads   uint64  `json:"loads"`
-	Patches uint64  `json:"patches,omitempty"`
-	Rebuilds uint64 `json:"rebuilds,omitempty"`
+	Hits     uint64   `json:"hits"`
+	Misses   uint64   `json:"misses"`
+	Loads    uint64   `json:"loads"`
+	Patches  uint64   `json:"patches,omitempty"`
+	Rebuilds uint64   `json:"rebuilds,omitempty"`
 	HitRatio *float64 `json:"hit_ratio"`
 }
 
 // RoutingCacheStats is exposed via /debug/cache/stats when pprof is enabled.
 type RoutingCacheStats struct {
-	Assembled RoutingCacheLayerStats `json:"assembled"`
-	Base      RoutingCacheLayerStats `json:"base"`
-	Overlay   RoutingCacheLayerStats `json:"overlay"`
+	Assembled    RoutingCacheLayerStats `json:"assembled"`
+	Base         RoutingCacheLayerStats `json:"base"`
+	Overlay      RoutingCacheLayerStats `json:"overlay"`
 	Invalidation struct {
 		TokenOnlySkipped uint64 `json:"token_only_skipped"`
 		BaseEvents       uint64 `json:"base_events"`
 		OverlayEvents    uint64 `json:"overlay_events"`
 		BulkRebuilds     uint64 `json:"bulk_rebuilds"`
+		AssembledPatches uint64 `json:"assembled_patches"`
+		OverlayPatches   uint64 `json:"overlay_patches"`
 	} `json:"invalidation"`
 	Sizes struct {
 		AssembledEntries int            `json:"assembled_entries"`
@@ -228,6 +230,8 @@ type routingCacheStats struct {
 	baseHits, baseMisses, baseLoads                atomic.Uint64
 	basePatches, baseRebuilds                      atomic.Uint64
 	overlayHits, overlayMisses, overlayLoads       atomic.Uint64
+	overlayPatches                                 atomic.Uint64
+	assembledPatches                               atomic.Uint64
 	tokenOnlySkipped, baseEvents, overlayEvents    atomic.Uint64
 	bulkRebuilds                                   atomic.Uint64
 }
@@ -249,7 +253,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[uint64]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -297,14 +301,16 @@ func (s *Selector) CacheStats() RoutingCacheStats {
 		return RoutingCacheStats{}
 	}
 	out := RoutingCacheStats{
-		Assembled: layerStats(s.cacheStats.assembledHits.Load(), s.cacheStats.assembledMisses.Load(), s.cacheStats.assembledLoads.Load(), 0, 0),
+		Assembled: layerStats(s.cacheStats.assembledHits.Load(), s.cacheStats.assembledMisses.Load(), s.cacheStats.assembledLoads.Load(), s.cacheStats.assembledPatches.Load(), 0),
 		Base:      layerStats(s.cacheStats.baseHits.Load(), s.cacheStats.baseMisses.Load(), s.cacheStats.baseLoads.Load(), s.cacheStats.basePatches.Load(), s.cacheStats.baseRebuilds.Load()),
-		Overlay:   layerStats(s.cacheStats.overlayHits.Load(), s.cacheStats.overlayMisses.Load(), s.cacheStats.overlayLoads.Load(), 0, 0),
+		Overlay:   layerStats(s.cacheStats.overlayHits.Load(), s.cacheStats.overlayMisses.Load(), s.cacheStats.overlayLoads.Load(), s.cacheStats.overlayPatches.Load(), 0),
 	}
 	out.Invalidation.TokenOnlySkipped = s.cacheStats.tokenOnlySkipped.Load()
 	out.Invalidation.BaseEvents = s.cacheStats.baseEvents.Load()
 	out.Invalidation.OverlayEvents = s.cacheStats.overlayEvents.Load()
 	out.Invalidation.BulkRebuilds = s.cacheStats.bulkRebuilds.Load()
+	out.Invalidation.AssembledPatches = s.cacheStats.assembledPatches.Load()
+	out.Invalidation.OverlayPatches = s.cacheStats.overlayPatches.Load()
 	s.candidateMu.Lock()
 	out.Sizes.AssembledEntries = len(s.candidates)
 	out.Sizes.BaseSnapshots = len(s.routingBases)
@@ -335,6 +341,8 @@ func (s *Selector) ResetCacheStats() {
 	s.cacheStats.overlayHits.Store(0)
 	s.cacheStats.overlayMisses.Store(0)
 	s.cacheStats.overlayLoads.Store(0)
+	s.cacheStats.overlayPatches.Store(0)
+	s.cacheStats.assembledPatches.Store(0)
 	s.cacheStats.tokenOnlySkipped.Store(0)
 	s.cacheStats.baseEvents.Store(0)
 	s.cacheStats.overlayEvents.Store(0)
@@ -1148,6 +1156,7 @@ func (s *Selector) routingVersionsStable(provider account.Provider, base, overla
 // projections never carry encrypted tokens, and EnsureCredential reloads secrets via Get.
 // Single-account base events patch in-memory bases (or drop one account) without clearing
 // the whole provider pool; bulk events without AccountID still full-rebuild on next load.
+// Model×account overlay events patch one overlay row (+ matching L3) when possible.
 func (s *Selector) ApplyInvalidation(event repository.InvalidationEvent) {
 	if !event.Valid() {
 		return
@@ -1161,6 +1170,10 @@ func (s *Selector) ApplyInvalidation(event repository.InvalidationEvent) {
 
 	if base && event.AccountID != 0 {
 		s.patchBaseAccount(event)
+		return
+	}
+	if overlay && event.AccountID != 0 && event.UpstreamModel != "" && event.Layer() == repository.InvalidationLayerOverlay {
+		s.patchOverlayAccount(event)
 		return
 	}
 
@@ -1328,11 +1341,260 @@ func (s *Selector) patchBaseAccount(event repository.InvalidationEvent) {
 	if changed {
 		s.cacheStats.basePatches.Add(1)
 	}
-	for key := range s.candidates {
-		if provider == "" || key.provider == provider {
-			delete(s.candidates, key)
+	// Patch L3 rows in place instead of deleting every assembled entry for the provider.
+	// Prefer the replacement base from any mode key (same credential state across modes).
+	var replacement *account.RoutingAccountBase
+	for _, next := range replacements {
+		if next != nil {
+			replacement = next
+			break
 		}
 	}
+	// If every mode said remove (nil), drop the account from L3.
+	drop := true
+	for _, next := range replacements {
+		if next != nil {
+			drop = false
+			break
+		}
+	}
+	if drop {
+		if patchAssembledAccountLocked(s.candidates, provider, accountID, nil) {
+			s.cacheStats.assembledPatches.Add(1)
+		}
+		return
+	}
+	if patchAssembledAccountLocked(s.candidates, provider, accountID, replacement) {
+		s.cacheStats.assembledPatches.Add(1)
+	}
+}
+
+// patchOverlayAccount updates one account's overlay row for a known upstream model
+// without clearing the whole model snapshot when warm L2/L3 entries exist.
+func (s *Selector) patchOverlayAccount(event repository.InvalidationEvent) {
+	s.cacheStats.overlayEvents.Add(1)
+	provider := event.Provider
+	accountID := event.AccountID
+	upstreamModel := event.UpstreamModel
+
+	lookup, hasLookup := s.accounts.(repository.RoutingAccountLookup)
+	if !hasLookup {
+		s.bulkClearOverlayModel(provider, upstreamModel)
+		return
+	}
+
+	s.candidateMu.Lock()
+	overlayKeys := make([]routingOverlayCacheKey, 0, 4)
+	for key := range s.routingOverlays {
+		if (provider == "" || key.provider == provider) && key.upstreamModel == upstreamModel {
+			overlayKeys = append(overlayKeys, key)
+		}
+	}
+	assembledKeys := make([]candidateCacheKey, 0, 4)
+	for key := range s.candidates {
+		if (provider == "" || key.provider == provider) && key.upstreamModel == upstreamModel {
+			assembledKeys = append(assembledKeys, key)
+		}
+	}
+	s.candidateMu.Unlock()
+
+	// Cold L2 and L3: bump overlay generation so the next load reloads from DB.
+	if len(overlayKeys) == 0 && len(assembledKeys) == 0 {
+		s.candidateMu.Lock()
+		if provider == "" {
+			s.overlayGlobalVersion++
+		} else {
+			s.overlayProviderVersion[provider]++
+		}
+		s.candidateMu.Unlock()
+		return
+	}
+
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), routingBasePointLoadTimeout)
+	defer cancel()
+
+	// Collect point-loaded overlay fields per modelRouteID (and quotaMode for L3).
+	type overlayPatch struct {
+		value account.RoutingAccountOverlay
+		drop  bool
+	}
+	overlayPatches := make(map[routingOverlayCacheKey]overlayPatch, len(overlayKeys))
+	for _, key := range overlayKeys {
+		candidate, err := lookup.GetRoutingCandidate(loadCtx, accountID, key.modelRouteID, upstreamModel, "")
+		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				overlayPatches[key] = overlayPatch{drop: true}
+				continue
+			}
+			s.bulkClearOverlayModel(provider, upstreamModel)
+			return
+		}
+		overlayPatches[key] = overlayPatch{value: account.RoutingAccountOverlay{
+			AccountID: accountID, Bound: true, ModelCapabilityKnown: candidate.ModelCapabilityKnown,
+			SupportsModel: candidate.SupportsModel, ModelQuotaBlock: candidate.ModelQuotaBlock,
+		}}
+	}
+
+	assembledPatches := make(map[candidateCacheKey]*account.RoutingCandidate, len(assembledKeys))
+	for _, key := range assembledKeys {
+		candidate, err := lookup.GetRoutingCandidate(loadCtx, accountID, key.modelRouteID, upstreamModel, key.quotaMode)
+		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				assembledPatches[key] = nil
+				continue
+			}
+			s.bulkClearOverlayModel(provider, upstreamModel)
+			return
+		}
+		copyCandidate := candidate
+		assembledPatches[key] = &copyCandidate
+	}
+
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	// Do not bump overlay generation: in-place patch keeps warm snapshots valid.
+	changedOverlay := false
+	for key, patch := range overlayPatches {
+		snap, ok := s.routingOverlays[key]
+		if !ok {
+			continue
+		}
+		values := make([]account.RoutingAccountOverlay, 0, len(snap.value.Values))
+		found := false
+		for _, row := range snap.value.Values {
+			if row.AccountID != accountID {
+				values = append(values, row)
+				continue
+			}
+			found = true
+			if !patch.drop {
+				values = append(values, patch.value)
+			}
+		}
+		if !found && !patch.drop {
+			values = append(values, patch.value)
+			found = true
+		}
+		if !found && patch.drop {
+			continue
+		}
+		snap.value.Values = values
+		snap.loadedAt = time.Now().UTC()
+		s.routingOverlays[key] = snap
+		changedOverlay = true
+	}
+	if changedOverlay {
+		s.cacheStats.overlayPatches.Add(1)
+	}
+
+	changedAssembled := false
+	for key, next := range assembledPatches {
+		snap, ok := s.candidates[key]
+		if !ok {
+			continue
+		}
+		if next == nil {
+			if dropAssembledAccountInSnapshot(&snap, accountID) {
+				s.candidates[key] = snap
+				changedAssembled = true
+			}
+			continue
+		}
+		if upsertAssembledAccountInSnapshot(&snap, *next) {
+			s.candidates[key] = snap
+			changedAssembled = true
+		}
+	}
+	if changedAssembled {
+		s.cacheStats.assembledPatches.Add(1)
+	}
+}
+
+// bulkClearOverlayModel clears warm L2/L3 for a model (fail-open / no lookup).
+func (s *Selector) bulkClearOverlayModel(provider account.Provider, upstreamModel string) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	if provider == "" {
+		s.overlayGlobalVersion++
+		clearRoutingOverlays(s.routingOverlays, "")
+	} else {
+		s.overlayProviderVersion[provider]++
+		if upstreamModel != "" {
+			clearRoutingOverlaysForModel(s.routingOverlays, provider, upstreamModel)
+		} else {
+			clearRoutingOverlays(s.routingOverlays, provider)
+		}
+	}
+	for key := range s.candidates {
+		if provider != "" && key.provider != provider {
+			continue
+		}
+		if upstreamModel != "" && key.upstreamModel != upstreamModel {
+			continue
+		}
+		delete(s.candidates, key)
+	}
+}
+
+// patchAssembledAccountLocked updates or drops one account in warm L3 snapshots.
+// caller must hold candidateMu. nextBase nil means drop. Overlay fields are preserved
+// when updating from a base replacement.
+func patchAssembledAccountLocked(candidates map[candidateCacheKey]candidateSnapshot, provider account.Provider, accountID uint64, nextBase *account.RoutingAccountBase) bool {
+	changed := false
+	for key, snap := range candidates {
+		if provider != "" && key.provider != provider {
+			continue
+		}
+		if nextBase == nil {
+			if dropAssembledAccountInSnapshot(&snap, accountID) {
+				candidates[key] = snap
+				changed = true
+			}
+			continue
+		}
+		index, found := snap.byAccount[accountID]
+		if !found || index >= len(snap.values) {
+			// Account not in this model assembled list — leave alone (may be unbound).
+			continue
+		}
+		next := append([]account.RoutingCandidate(nil), snap.values...)
+		candidate := next[index]
+		candidate.Credential = nextBase.Credential
+		candidate.Billing = nextBase.Billing
+		candidate.QuotaWindow = nextBase.QuotaWindow
+		candidate.QuotaRecovery = nextBase.QuotaRecovery
+		next[index] = candidate
+		snap.values = next
+		// byAccount indexes unchanged
+		candidates[key] = snap
+		changed = true
+	}
+	return changed
+}
+
+func dropAssembledAccountInSnapshot(snap *candidateSnapshot, accountID uint64) bool {
+	index, found := snap.byAccount[accountID]
+	if !found || index >= len(snap.values) {
+		return false
+	}
+	next := make([]account.RoutingCandidate, 0, len(snap.values)-1)
+	next = append(next, snap.values[:index]...)
+	next = append(next, snap.values[index+1:]...)
+	*snap = newCandidateSnapshot(next, snap.baseGen, snap.overlayGen, snap.loadedAt)
+	return true
+}
+
+func upsertAssembledAccountInSnapshot(snap *candidateSnapshot, candidate account.RoutingCandidate) bool {
+	index, found := snap.byAccount[candidate.Credential.ID]
+	if found && index < len(snap.values) {
+		next := append([]account.RoutingCandidate(nil), snap.values...)
+		next[index] = candidate
+		snap.values = next
+		return true
+	}
+	next := append(append([]account.RoutingCandidate(nil), snap.values...), candidate)
+	*snap = newCandidateSnapshot(next, snap.baseGen, snap.overlayGen, time.Now().UTC())
+	return true
 }
 
 // bulkRebuildBase clears warm L1 bases (and assembled) for a provider so the next load full-lists.

@@ -26,8 +26,16 @@ type ConcurrencyLimiter interface {
 }
 
 // ConcurrencySnapshotReader 批量读取并发租约快照；调度器会优先使用它减少远程运行态往返。
+// CurrentMany 对每个 key 都返回 entry（含 0）；小集合/admin 路径使用。
 type ConcurrencySnapshotReader interface {
 	CurrentMany(ctx context.Context, keys []string) (map[string]int, error)
+}
+
+// AccountConcurrencySnapshotReader 按账号 ID 批量读取推理租约快照。
+// 返回的 map 仅包含 count>0 的账号（稀疏）；缺失 id 视为 0。
+// 选号热路径优先使用该接口，避免为全池预分配 dense string map。
+type AccountConcurrencySnapshotReader interface {
+	CurrentManyAccountIDs(ctx context.Context, accountIDs []uint64) (map[uint64]int, error)
 }
 
 // StickySessionRepository 定义有过期时间的会话账号粘滞状态。
