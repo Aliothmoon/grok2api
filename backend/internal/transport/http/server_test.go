@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 )
 
@@ -214,6 +215,9 @@ func TestBackendPathsIncludeDebugPrefix(t *testing.T) {
 	if !isBackendPath("/debug/cache/stats") {
 		t.Fatal("expected /debug/cache/stats to be treated as a backend path")
 	}
+	if !isBackendPath("/debug/selector/stats") {
+		t.Fatal("expected /debug/selector/stats to be treated as a backend path")
+	}
 }
 
 func TestCacheStatsRegistrationFollowsPprofGate(t *testing.T) {
@@ -285,6 +289,87 @@ func TestCacheStatsRegistrationFollowsPprofGate(t *testing.T) {
 	if getRec.Code == http.StatusOK && resetCalls > 1 {
 		t.Fatalf("GET reset mutated state: status=%d calls=%d", getRec.Code, resetCalls)
 	}
+	if resetCalls != 1 {
+		t.Fatalf("GET reset should not call reset handler: calls=%d", resetCalls)
+	}
+}
+
+func TestSelectorStatsRegistrationFollowsPprofGate(t *testing.T) {
+	disabledDeps := testDependencies()
+	disabledDeps.Logger = slog.Default()
+	disabledDeps.SelectorStats = func() any {
+		return gateway.SelectionStatsView{Totals: gateway.SelectionTotals{Claims: 1}}
+	}
+	disabled := New(disabledDeps)
+	disabledReq := httptest.NewRequest(http.MethodGet, "/debug/selector/stats", nil)
+	disabledRec := httptest.NewRecorder()
+	disabled.ServeHTTP(disabledRec, disabledReq)
+	if disabledRec.Code != http.StatusNotFound {
+		t.Fatalf("pprof disabled: selector stats status=%d want 404 body=%s", disabledRec.Code, disabledRec.Body.String())
+	}
+
+	var resetCalls int
+	enabledDeps := testDependencies()
+	enabledDeps.Logger = slog.Default()
+	enabledDeps.PprofEnabled = true
+	enabledDeps.SelectorStats = func() any {
+		return gateway.SelectionStatsView{
+			Window: gateway.SelectionWindow{Note: "test"},
+			Totals: gateway.SelectionTotals{Claims: 3, ByPath: map[string]uint64{"heap": 3}},
+			Skew:   gateway.SelectionSkewStats{Top1ClaimRatio: 1, UniqueAccountsClaimed: 1},
+			ByProvider: map[string]gateway.SelectionProviderStats{
+				"grok_build": {
+					Claims: 3,
+					Accounts: []gateway.SelectionAccountStats{{
+						AccountID: 7, Name: "a", Claims: 3, ClaimRatio: 1,
+					}},
+				},
+			},
+		}
+	}
+	enabledDeps.ResetSelectorStats = func() { resetCalls++ }
+	staticRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(staticRoot, "index.html"), []byte("<!doctype html><title>spa</title>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	enabledDeps.FrontendStaticPath = staticRoot
+	enabled := New(enabledDeps)
+
+	req := httptest.NewRequest(http.MethodGet, "/debug/selector/stats", nil)
+	rec := httptest.NewRecorder()
+	enabled.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enabled selector stats status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "<!doctype html>") {
+		t.Fatalf("selector stats returned SPA HTML: %s", rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["enabled"] != true {
+		t.Fatalf("body=%#v", body)
+	}
+	totals, _ := body["totals"].(map[string]any)
+	if totals == nil || totals["claims"] != float64(3) {
+		t.Fatalf("totals=%#v body=%#v", totals, body)
+	}
+	byProvider, _ := body["by_provider"].(map[string]any)
+	if byProvider == nil || byProvider["grok_build"] == nil {
+		t.Fatalf("by_provider=%#v", byProvider)
+	}
+
+	resetReq := httptest.NewRequest(http.MethodPost, "/debug/selector/stats/reset", nil)
+	resetRec := httptest.NewRecorder()
+	enabled.ServeHTTP(resetRec, resetReq)
+	if resetRec.Code != http.StatusOK || resetCalls != 1 {
+		t.Fatalf("reset status=%d calls=%d body=%s", resetRec.Code, resetCalls, resetRec.Body.String())
+	}
+
+	getReset := httptest.NewRequest(http.MethodGet, "/debug/selector/stats/reset", nil)
+	getRec := httptest.NewRecorder()
+	enabled.ServeHTTP(getRec, getReset)
 	if resetCalls != 1 {
 		t.Fatalf("GET reset should not call reset handler: calls=%d", resetCalls)
 	}

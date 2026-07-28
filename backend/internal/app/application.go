@@ -366,6 +366,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies,
 		SwaggerEnabled: cfg.Server.SwaggerEnabled, PprofEnabled: cfg.Server.PprofEnabled,
 		CacheStats: func() any { return gatewayService.CacheStats() }, ResetCacheStats: gatewayService.ResetCacheStats,
+		SelectorStats: func() any { return gatewayService.SelectionStats() }, ResetSelectorStats: gatewayService.ResetSelectionStats,
 		PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath,
 		Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService,
 		AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService,

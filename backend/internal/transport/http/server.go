@@ -47,7 +47,11 @@ type Dependencies struct {
 	// CacheStats, when non-nil and PprofEnabled, is served at GET /debug/cache/stats.
 	CacheStats func() any
 	// ResetCacheStats, when non-nil and PprofEnabled, is served at POST /debug/cache/stats/reset.
-	ResetCacheStats    func()
+	ResetCacheStats func()
+	// SelectorStats, when non-nil and PprofEnabled, is served at GET /debug/selector/stats.
+	SelectorStats func() any
+	// ResetSelectorStats, when non-nil and PprofEnabled, is served at POST /debug/selector/stats/reset.
+	ResetSelectorStats func()
 	PublicAPIBaseURL   string
 	FrontendStaticPath string
 	// Readiness 返回可观测的分层就绪状态。Ready 仅为旧调用方保留。
@@ -144,6 +148,10 @@ func New(deps Dependencies) *gin.Engine {
 		if deps.CacheStats != nil {
 			registerCacheStats(router, deps.CacheStats, deps.ResetCacheStats)
 			deps.Logger.Info("cache_stats_enabled", "path", "/debug/cache/stats")
+		}
+		if deps.SelectorStats != nil {
+			registerSelectorStats(router, deps.SelectorStats, deps.ResetSelectorStats)
+			deps.Logger.Info("selector_stats_enabled", "path", "/debug/selector/stats")
 		}
 	}
 	mediaHandler := mediahttp.NewHandler(deps.Media)

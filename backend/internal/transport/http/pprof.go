@@ -66,3 +66,34 @@ func registerCacheStats(router *gin.Engine, stats func() any, reset func()) {
 		})
 	}
 }
+
+// registerSelectorStats mounts account-selection business metrics under /debug/selector/stats.
+// Same enablement gate as pprof: unauthenticated, debug-only.
+func registerSelectorStats(router *gin.Engine, stats func() any, reset func()) {
+	if stats == nil {
+		return
+	}
+	router.GET("/debug/selector/stats", func(c *gin.Context) {
+		snapshot := stats()
+		body := gin.H{
+			"enabled":      true,
+			"generated_at": time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		switch value := snapshot.(type) {
+		case gateway.SelectionStatsView:
+			body["window"] = value.Window
+			body["totals"] = value.Totals
+			body["skew"] = value.Skew
+			body["by_provider"] = value.ByProvider
+		default:
+			body["stats"] = snapshot
+		}
+		c.JSON(http.StatusOK, body)
+	})
+	if reset != nil {
+		router.POST("/debug/selector/stats/reset", func(c *gin.Context) {
+			reset()
+			c.JSON(http.StatusOK, gin.H{"ok": true})
+		})
+	}
+}

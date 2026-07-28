@@ -317,6 +317,22 @@ func (s *Service) ResetCacheStats() {
 	s.selector.ResetCacheStats()
 }
 
+// SelectionStats returns process-local account selection business metrics.
+func (s *Service) SelectionStats() SelectionStatsView {
+	if s == nil || s.selector == nil {
+		return SelectionStatsView{ByProvider: map[string]SelectionProviderStats{}}
+	}
+	return s.selector.SelectionStats(defaultSelectionStatsTopN)
+}
+
+// ResetSelectionStats clears account selection business metrics.
+func (s *Service) ResetSelectionStats() {
+	if s == nil || s.selector == nil {
+		return
+	}
+	s.selector.ResetSelectionStats()
+}
+
 func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64(maxAttempts)) }
 
 func (s *Service) UpdateRequestTimeout(value time.Duration) {

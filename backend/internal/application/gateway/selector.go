@@ -150,7 +150,7 @@ func (l *accountLease) Release() {
 
 func (l *accountLease) markSelectorUpstreamStarted() {
 	if l != nil && l.selectorObservation != nil {
-		l.selectorObservation.upstreamStarted.Store(true)
+		l.selectorObservation.markUpstreamStarted()
 	}
 }
 
@@ -189,6 +189,7 @@ type Selector struct {
 	candidateLoads         singleflight.Group
 	concurrencySnapshots   *resultcache.Cache[[32]byte, map[uint64]int]
 	cacheStats             routingCacheStats
+	selectionStats         *selectionStatsStore
 	tierOrders             interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
@@ -253,7 +254,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[uint64]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[uint64]int](maxConcurrencySnapshots, concurrencySnapshotTTL), selectionStats: newSelectionStatsStore()}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -347,6 +348,64 @@ func (s *Selector) ResetCacheStats() {
 	s.cacheStats.baseEvents.Store(0)
 	s.cacheStats.overlayEvents.Store(0)
 	s.cacheStats.bulkRebuilds.Store(0)
+}
+
+// SelectionStats returns process-local account selection business metrics.
+func (s *Selector) SelectionStats(topN int) SelectionStatsView {
+	if s == nil || s.selectionStats == nil {
+		return SelectionStatsView{ByProvider: map[string]SelectionProviderStats{}}
+	}
+	return s.selectionStats.Snapshot(topN)
+}
+
+// ResetSelectionStats clears account selection business metrics.
+func (s *Selector) ResetSelectionStats() {
+	if s == nil || s.selectionStats == nil {
+		return
+	}
+	s.selectionStats.Reset()
+}
+
+// finalizeLease attaches selection observation + claim counters for a lease returned to callers.
+// Temporary internal claims that are released before return are intentionally not counted.
+// stage keeps the raw path label (e.g. first_window / heap) for observation and perfmetrics;
+// selection business stats store a normalized path via normalizeSelectionPath.
+func (s *Selector) finalizeLease(lease *accountLease, stage string, recordSegmented bool) *accountLease {
+	if lease == nil {
+		return nil
+	}
+	if stage == "" {
+		stage = selectionPathHeap
+	}
+	statsPath := normalizeSelectionPath(stage)
+	if s != nil && s.selectionStats == nil {
+		s.selectionStats = newSelectionStatsStore()
+	}
+	var stats *selectionStatsStore
+	if s != nil {
+		stats = s.selectionStats
+	}
+	if lease.selectorObservation == nil {
+		lease.selectorObservation = &selectorLeaseObservation{
+			provider:        lease.Credential.Provider,
+			accountID:       lease.Credential.ID,
+			stage:           stage,
+			stats:           stats,
+			recordSegmented: recordSegmented,
+		}
+	} else {
+		lease.selectorObservation.provider = lease.Credential.Provider
+		lease.selectorObservation.accountID = lease.Credential.ID
+		lease.selectorObservation.stage = stage
+		lease.selectorObservation.stats = stats
+		if recordSegmented {
+			lease.selectorObservation.recordSegmented = true
+		}
+	}
+	if stats != nil {
+		stats.recordClaim(lease.Credential.Provider, lease.Credential.ID, lease.Credential.Name, statsPath)
+	}
+	return lease
 }
 
 func (s *Selector) Acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
@@ -448,7 +507,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 			lease.QuotaProbe = true
 			lease.QuotaProbeKind = candidate.QuotaRecovery.Kind
 			lease.Billing = candidate.Billing
-			return lease, nil
+			return s.finalizeLease(lease, selectionPathProbe, false), nil
 		}
 	}
 	var saturatedStickyID uint64
@@ -474,7 +533,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 					if acquireErr == nil {
 						lease.Billing = candidate.Billing
 						lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-						return lease, nil
+						return s.finalizeLease(lease, selectionPathSticky, false), nil
 					}
 					if !isSelectionUnavailable(acquireErr, SelectionSaturated) {
 						return nil, acquireErr
@@ -504,7 +563,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 			}
 			lease.Billing = candidate.Billing
 			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-			return lease, nil
+			return s.finalizeLease(lease, selectionPathStickyBorrow, false), nil
 		}
 		return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
 	}
@@ -530,7 +589,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 			if lease == nil {
 				continue
 			}
+			path := selectionPathHeap
 			if stickyKey != "" {
+				path = selectionPathStickyBind
 				stickyTTL, _, _, _ := s.routingConfig()
 				boundID, bindErr := s.sticky.Bind(ctx, stickyKey, candidate.Credential.ID, currentTime, currentTime.Add(stickyTTL))
 				if bindErr != nil {
@@ -544,13 +605,14 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 							lease.Release()
 							boundLease.Billing = boundCandidate.Billing
 							boundLease.QuotaMode = effectiveQuotaMode(boundCandidate, quotaMode)
-							return boundLease, nil
+							return s.finalizeLease(boundLease, selectionPathSticky, false), nil
 						}
 						if !isSelectionUnavailable(boundErr, SelectionSaturated) {
 							lease.Release()
 							return nil, boundErr
 						}
 						// 已绑定账号满载时保留原绑定，本次请求使用已获取的临时账号。
+						path = selectionPathStickyBorrow
 					} else if err := s.sticky.Set(ctx, stickyKey, candidate.Credential.ID, currentTime.Add(stickyTTL)); err != nil {
 						lease.Release()
 						return nil, fmt.Errorf("重建会话粘滞状态: %w", err)
@@ -559,7 +621,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 			}
 			lease.Billing = candidate.Billing
 			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-			return lease, nil
+			return s.finalizeLease(lease, path, false), nil
 		}
 		if capacityWait <= 0 {
 			return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
@@ -649,7 +711,7 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 			lease.QuotaProbe = true
 			lease.QuotaProbeKind = recovery.Kind
 			lease.Billing = candidate.Billing
-			return lease, nil
+			return s.finalizeLease(lease, selectionPathProbe, false), nil
 		}
 		if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
 			return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted}
@@ -668,7 +730,7 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 	}
 	lease.Billing = candidate.Billing
 	lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-	return lease, nil
+	return s.finalizeLease(lease, selectionPathPinned, false), nil
 }
 
 func (s *Selector) loadPinnedCandidate(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string) (account.RoutingCandidate, error) {

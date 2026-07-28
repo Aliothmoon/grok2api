@@ -397,8 +397,8 @@ func TestSegmentedActiveSkipsStickyPinnedAndSmallPools(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer lease.Release()
-			if lease.selectorObservation != nil {
-				t.Fatalf("non-active path received observation: %#v", lease.selectorObservation)
+			if observation := lease.selectorObservation; observation != nil && observation.recordSegmented {
+				t.Fatalf("non-active path marked segmented observation: %#v", observation)
 			}
 			if activeSegmentedCursorCount(selector) != 0 {
 				t.Fatal("non-active path advanced the segmented cursor")
@@ -437,7 +437,7 @@ func TestSegmentedActiveLifecycleRecordsFinalOutcomeOnce(t *testing.T) {
 			previous := perfmetrics.Default
 			perfmetrics.Default = registry
 			defer func() { perfmetrics.Default = previous }()
-			observation := &selectorLeaseObservation{provider: account.ProviderBuild, stage: "first_window"}
+			observation := &selectorLeaseObservation{provider: account.ProviderBuild, stage: "first_window", recordSegmented: true}
 			test.record(observation)
 			assertSegmentedMetric(t, registry.CollectAndReset(), "selector_segmented_active_upstream_total", "first_window", test.outcome, 1)
 		})

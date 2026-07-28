@@ -31,7 +31,10 @@ type segmentedSelectorCohort struct {
 
 type selectorLeaseObservation struct {
 	provider        account.Provider
+	accountID       uint64
 	stage           string
+	stats           *selectionStatsStore
+	recordSegmented bool
 	upstreamStarted atomic.Bool
 	completed       atomic.Bool
 }
@@ -54,6 +57,18 @@ func segmentedSelectorShard(provider account.Provider, upstreamModel, quotaMode 
 	_, _ = hash.Write([]byte{0})
 	_, _ = hash.Write([]byte(quotaMode))
 	return hash.Sum64() % segmentedSelectorShards
+}
+
+func (o *selectorLeaseObservation) markUpstreamStarted() {
+	if o == nil {
+		return
+	}
+	if !o.upstreamStarted.CompareAndSwap(false, true) {
+		return
+	}
+	if o.stats != nil {
+		o.stats.recordUpstreamStarted(o.provider, o.accountID)
+	}
 }
 
 func (o *selectorLeaseObservation) completeRelease() {
@@ -80,6 +95,12 @@ func (o *selectorLeaseObservation) complete(success bool) {
 
 func (o *selectorLeaseObservation) record(outcome string) {
 	if o == nil || !o.completed.CompareAndSwap(false, true) {
+		return
+	}
+	if o.stats != nil {
+		o.stats.recordUpstreamOutcome(o.provider, o.accountID, outcome)
+	}
+	if !o.recordSegmented {
 		return
 	}
 	perfmetrics.Default.Inc("selector_segmented_active_upstream_total", perfmetrics.Labels{
