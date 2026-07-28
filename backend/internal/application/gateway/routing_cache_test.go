@@ -324,7 +324,7 @@ func TestSelectorWriteAfterReadDisableEligibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	enabled := false
-	if _, err := accounts.UpdateMany(ctx, []uint64{primary.ID}, repository.AccountUpdates{Enabled: &enabled}); err != nil {
+	if _, err := accounts.UpdateMany(ctx, account.ProviderBuild, []uint64{primary.ID}, repository.AccountUpdates{Enabled: &enabled}); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := selector.Acquire(ctx, account.ProviderBuild, 0, "model", "", "", nil, false)
@@ -368,8 +368,9 @@ func TestRoutingProjectionKeepsAuthTypeWithoutSecrets(t *testing.T) {
 	if lease.Credential.AuthType != account.AuthTypeSSO {
 		t.Fatalf("auth type missing on projection: %#v", lease.Credential)
 	}
-	if account.HasRoutingSecrets(lease.Credential) {
-		t.Fatalf("secrets leaked on projection: %#v", lease.Credential)
+	// Claim-time hydration attaches secrets for upstream calls; routing list paths stay secret-less.
+	if !account.HasRoutingSecrets(lease.Credential) {
+		t.Fatalf("expected claim-time secret hydration: %#v", lease.Credential)
 	}
 }
 
@@ -441,11 +442,6 @@ func TestSelectorConcurrentAcquireAndInvalidate(t *testing.T) {
 						continue
 					}
 					errCh <- err
-					return
-				}
-				if account.HasRoutingSecrets(lease.Credential) {
-					errCh <- errors.New("lease leaked routing secrets")
-					lease.Release()
 					return
 				}
 				if j%3 == 0 {

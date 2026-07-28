@@ -2,7 +2,7 @@ package gateway
 
 import (
 	"context"
-	"github.com/chenyme/grok2api/backend/internal/pkg/json"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -301,21 +301,12 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		return
 	}
 	defer lease.Release()
-	// Selection returns secret-less routing projections; hydrate tokens before upstream video calls.
 	credential, err := s.accounts.EnsureCredential(ctx, lease.Credential, false)
 	if err != nil {
-		if parent.Err() != nil {
-			s.deferVideoJob(parent, job)
-			return
-		}
-		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
-		if isSSOCredentialRejected(err, lease.Credential) || isSSOCredentialRejected(err, credential) {
-			s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
-		}
-		failureCancel()
-		s.failVideoJob(parent, job, "credential_unavailable", err)
+		s.failVideoJob(parent, job, "account_unavailable", err)
 		return
 	}
+	lease.Credential = credential
 	adapter, ok := s.providers.Videos(route.Provider)
 	if !ok {
 		s.failVideoJob(parent, job, "provider_unavailable", ErrNoAvailableAccount)
@@ -323,7 +314,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	}
 	lastProgress := job.Progress
 	result, err := adapter.GenerateVideo(ctx, provider.VideoRequest{
-		Credential: credential, Billing: lease.Billing, JobID: job.ID, Prompt: job.Prompt, Duration: job.Seconds, AspectRatio: job.Size, Resolution: job.Quality,
+		Credential: lease.Credential, Billing: lease.Billing, JobID: job.ID, Prompt: job.Prompt, Duration: job.Seconds, AspectRatio: job.Size, Resolution: job.Quality,
 		ReferenceURLs: decodeVideoInput(job.InputJSON),
 		Progress: func(value int) {
 			value = min(99, max(1, value))
@@ -340,7 +331,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		},
 	})
 	if err == nil && result.AssetID == "" && result.URL != "" {
-		result, err = s.persistRemoteVideo(ctx, job.ID, adapter, credential, result)
+		result, err = s.persistRemoteVideo(ctx, job.ID, adapter, lease.Credential, result)
 	}
 	if err != nil {
 		if parent.Err() != nil {
@@ -350,48 +341,48 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
 		failureHandled := false
 		if errors.Is(err, provider.ErrUnauthorized) {
-			if credential.AuthType == account.AuthTypeSSO || lease.Credential.AuthType == account.AuthTypeSSO {
-				s.markSSOCredentialRejected(failureCtx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+			if lease.Credential.AuthType == account.AuthTypeSSO {
+				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
 			}
 			failureHandled = true
 		} else if status, ok := provider.ErrorHTTPStatus(err); ok {
 			switch {
-			case status == http.StatusUnauthorized && (credential.AuthType == account.AuthTypeSSO || lease.Credential.AuthType == account.AuthTypeSSO):
-				s.markSSOCredentialRejected(failureCtx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+			case status == http.StatusUnauthorized && lease.Credential.AuthType == account.AuthTypeSSO:
+				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
 				failureHandled = true
-			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(credential.Provider):
+			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(lease.Credential.Provider):
 				// Web Provider 已对 anti-bot 403 降低出口健康并重建浏览器会话；
 				// 视频请求已提交，不能换号重试，也不能误伤账号池。
 				// 符合资格的 Build 主地址 403 由 Adapter 尝试 XAI，不在此禁用账号。
 				failureHandled = true
-			case status == http.StatusForbidden && credential.Provider == account.ProviderBuild:
-				if !account.IsBuildSuper(credential, lease.Billing) {
+			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
+				if !account.IsBuildSuper(lease.Credential, lease.Billing) {
 					// 非 Super 的 403 按账号级故障处理；auto 模式不会因此回退 XAI。
-					s.selector.MarkFailure(failureCtx, credential, status, 0)
+					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				}
 				// Super（Billing paid 或 entitlement）的 403 保持服务级处理。
 				failureHandled = true
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, credential.ID, lease.QuotaMode, 0)
-				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
+				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
+				s.selector.MarkQuotaStateChanged(lease.Credential.Provider)
 				if reconcileErr != nil || !exhausted {
-					s.selector.MarkFailure(failureCtx, credential, status, 0)
+					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				}
 				failureHandled = true
 			case status >= http.StatusInternalServerError:
 				// 5xx 是 Provider 服务级故障，不应让某个账号退出号池。
 				failureHandled = true
 			default:
-				s.selector.MarkFailure(failureCtx, credential, status, 0)
+				s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				failureHandled = true
 			}
 		}
 		if !failureHandled && !provider.IsMediaPostProcessingError(err) {
-			s.selector.MarkFailure(failureCtx, credential, 0, 0)
+			s.selector.MarkFailure(failureCtx, lease.Credential, 0, 0)
 		}
 		failureCancel()
 		applyMediaJobEgress(&job, egressTrace, route.Provider)
-		s.logVideoGenerationFailure(job, credential, err)
+		s.logVideoGenerationFailure(job, lease.Credential, err)
 		failureCode, publicErr := "generation_failed", err
 		if status, ok := provider.ErrorHTTPStatus(err); errors.Is(err, provider.ErrUnauthorized) || (ok && (status == http.StatusUnauthorized || status == http.StatusForbidden)) {
 			failureCode, publicErr = "provider_unavailable", errors.New("上游服务暂不可用")

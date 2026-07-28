@@ -2,217 +2,166 @@ package relational
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
-	"github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
-func TestListRoutingAccountBasesExcludesEncryptedTokens(t *testing.T) {
+func TestRoutingProjectionLeavesSecretsAndLargeJSONOutOfCandidateLoad(t *testing.T) {
 	ctx := context.Background()
 	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "routing-projection.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = database.Close() })
+	defer database.Close()
 	if err := database.InitializeSchema(ctx); err != nil {
 		t.Fatal(err)
 	}
 	accounts := NewAccountRepository(database)
+	now := time.Now().UTC().Truncate(time.Second)
 	created, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "secret-account", SourceKey: "secret-account",
-		EncryptedAccessToken: "access-secret", EncryptedRefreshToken: "refresh-secret",
-		EncryptedCloudflareCookie: "cf-secret", AuthStatus: account.AuthStatusActive, Enabled: true,
-		Priority: 10, MaxConcurrent: 2,
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "routing projection", Email: "route@example.test",
+		SourceKey: "routing:projection", OIDCClientID: "client-id", EncryptedAccessToken: "access-secret",
+		EncryptedCloudflareCookie: "cookie-secret", ExpiresAt: now.Add(time.Hour), Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 9, MaxConcurrent: 3, MinimumRemaining: 1.5,
+		WebTier: account.WebTierSuper,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	full, err := accounts.Get(ctx, created.ID)
-	if err != nil {
+	if err := accounts.SaveBilling(ctx, account.Billing{
+		AccountID: created.ID, PlanCode: "super", MonthlyLimit: 100, Used: 12, SyncedAt: now,
+		History: []account.BillingHistoryEntry{{Year: 2026, Month: 7, IncludedUsed: 12}},
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if !account.HasRoutingSecrets(full) {
-		t.Fatalf("Get should retain secrets: %#v", full)
+	resetAt := now.Add(time.Hour)
+	if err := accounts.SaveQuotaWindows(ctx, created.ID, account.WebTierSuper, now, []account.QuotaWindow{{
+		AccountID: created.ID, Mode: "weekly", Remaining: 10, Total: 20, UsagePercent: 50,
+		Breakdown:     []account.QuotaBreakdown{{ProductCode: account.QuotaProductChat, UsagePercent: 50}},
+		WindowSeconds: 3600, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceUpstream,
+	}}); err != nil {
+		t.Fatal(err)
 	}
 
-	bases, err := accounts.ListRoutingAccountBases(ctx, account.ProviderBuild, "")
+	bases, err := accounts.ListRoutingAccountBases(ctx, account.ProviderWeb, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(bases) != 1 {
-		t.Fatalf("bases = %#v", bases)
+		t.Fatalf("routing bases = %d, want 1", len(bases))
 	}
-	if account.HasRoutingSecrets(bases[0].Credential) {
-		t.Fatalf("routing base leaked secrets: %#v", bases[0].Credential)
+	assertRoutingProjection(t, bases[0].Credential, created)
+	if bases[0].Billing == nil || bases[0].Billing.PlanCode != "super" || len(bases[0].Billing.History) != 0 {
+		t.Fatalf("routing billing = %#v, want scalar billing without history", bases[0].Billing)
 	}
-	if bases[0].Credential.ID != created.ID || bases[0].Credential.Priority != 10 {
-		t.Fatalf("routing projection missing identity fields: %#v", bases[0].Credential)
-	}
-	if bases[0].Credential.AuthType != account.AuthTypeOAuth {
-		t.Fatalf("routing projection missing auth type: %#v", bases[0].Credential)
+	if bases[0].QuotaWindow == nil || bases[0].QuotaWindow.Remaining != 10 || len(bases[0].QuotaWindow.Breakdown) != 0 {
+		t.Fatalf("routing quota = %#v, want scalar quota without breakdown", bases[0].QuotaWindow)
 	}
 
-	candidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderBuild, 0, "model-a", "")
+	candidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderWeb, 0, "grok-test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 1 || account.HasRoutingSecrets(candidates[0].Credential) {
-		t.Fatalf("routing candidates leaked secrets: %#v", candidates)
+	if len(candidates) != 1 {
+		t.Fatalf("routing candidates = %d, want 1", len(candidates))
+	}
+	assertRoutingProjection(t, candidates[0].Credential, created)
+	if candidates[0].Billing == nil || len(candidates[0].Billing.History) != 0 || candidates[0].QuotaWindow == nil || len(candidates[0].QuotaWindow.Breakdown) != 0 {
+		t.Fatalf("routing candidate loaded large payloads: %#v", candidates[0])
+	}
+
+	// Management reads retain their complete representations.
+	managed, err := accounts.ListEnabled(ctx, account.ProviderWeb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(managed) != 1 || managed[0].EncryptedAccessToken != "access-secret" || managed[0].EncryptedCloudflareCookie != "cookie-secret" {
+		t.Fatalf("management credentials = %#v", managed)
+	}
+	billing, err := accounts.GetBilling(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(billing.History) != 1 {
+		t.Fatalf("management billing history = %#v, want one entry", billing.History)
+	}
+	windows, err := accounts.GetQuotaWindows(ctx, []uint64{created.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windows[created.ID]) != 1 || len(windows[created.ID][0].Breakdown) != 1 {
+		t.Fatalf("management quota windows = %#v, want breakdown", windows)
 	}
 }
 
-func TestGetRoutingCandidateDoesNotScanFullPool(t *testing.T) {
+func TestGetCredentialMaterialHydratesOneAccountAndMapsNotFound(t *testing.T) {
 	ctx := context.Background()
-	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "routing-point.db"))
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "credential-material.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = database.Close() })
+	defer database.Close()
 	if err := database.InitializeSchema(ctx); err != nil {
 		t.Fatal(err)
 	}
 	accounts := NewAccountRepository(database)
-	models := NewModelRepository(database)
-	target, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "target", SourceKey: "target",
-		EncryptedAccessToken: "access", EncryptedRefreshToken: "refresh",
-		AuthStatus: account.AuthStatusActive, Enabled: true, Priority: 5,
+	now := time.Now().UTC().Truncate(time.Second)
+	created, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "hydrate", SourceKey: "credential:material",
+		OIDCClientID: "client-id", EncryptedAccessToken: "access-secret", EncryptedRefreshToken: "refresh-secret",
+		EncryptedCloudflareCookie: "cookie-secret", ExpiresAt: now.Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 20; i++ {
-		if _, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
-			Provider: account.ProviderBuild, Name: "other", SourceKey: "other-" + string(rune('a'+i)),
-			EncryptedAccessToken: "access", AuthStatus: account.AuthStatusActive, Enabled: true,
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	now := time.Now().UTC()
-	if err := models.ReplaceAccountCapabilities(ctx, target.ID, []string{"model-a"}, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
-		AccountID: target.ID, Kind: account.QuotaRecoveryKindFree, Status: account.QuotaRecoveryStatusExhausted,
-		NextProbeAt: &now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
 
-	candidate, err := accounts.GetRoutingCandidate(ctx, target.ID, 0, "model-a", "")
+	material, err := accounts.GetCredentialMaterial(ctx, created.ID, account.ProviderBuild)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if candidate.Credential.ID != target.ID {
-		t.Fatalf("candidate id = %d", candidate.Credential.ID)
+	if material.AccountID != created.ID || material.Provider != account.ProviderBuild || material.AuthType != account.AuthTypeOAuth || material.OIDCClientID != "client-id" ||
+		material.EncryptedAccessToken != "access-secret" || material.EncryptedRefreshToken != "refresh-secret" || material.EncryptedCloudflareCookie != "cookie-secret" ||
+		!material.ExpiresAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("credential material = %#v", material)
 	}
-	if account.HasRoutingSecrets(candidate.Credential) {
-		t.Fatalf("point lookup leaked secrets: %#v", candidate.Credential)
+	hydrated, ok := material.ApplyTo(account.Credential{ID: created.ID, Provider: account.ProviderBuild})
+	if !ok || hydrated.EncryptedAccessToken != "access-secret" || hydrated.EncryptedRefreshToken != "refresh-secret" {
+		t.Fatalf("hydrated credential = %#v, ok=%v", hydrated, ok)
 	}
-	if !candidate.SupportsModel || candidate.QuotaRecovery == nil {
-		t.Fatalf("candidate missing attachments: %#v", candidate)
+	if _, ok := material.ApplyTo(account.Credential{ID: created.ID + 1}); ok {
+		t.Fatal("credential material applied to a different account")
 	}
-
-	missing, err := accounts.GetRoutingCandidate(ctx, 999999, 0, "model-a", "")
-	if !errorsIsNotFound(err) {
-		t.Fatalf("missing candidate = %#v err=%v", missing, err)
+	if _, ok := material.ApplyTo(account.Credential{ID: created.ID, Provider: account.ProviderWeb}); ok {
+		t.Fatal("credential material applied to a different provider")
+	}
+	if _, err := accounts.GetCredentialMaterial(ctx, created.ID+1, account.ProviderBuild); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("missing credential material error = %v, want ErrNotFound", err)
+	}
+	if _, err := accounts.GetCredentialMaterial(ctx, created.ID, account.ProviderWeb); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("cross-provider credential material error = %v, want ErrNotFound", err)
+	}
+	disabled := false
+	if _, err := accounts.UpdateMany(ctx, account.ProviderBuild, []uint64{created.ID}, repository.AccountUpdates{Enabled: &disabled}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accounts.GetCredentialMaterial(ctx, created.ID, account.ProviderBuild); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("disabled credential material error = %v, want ErrNotFound", err)
 	}
 }
 
-func TestGetRoutingCandidateApplySharedSuperBuildModel(t *testing.T) {
-	ctx := context.Background()
-	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "routing-super-shared.db"))
-	if err != nil {
-		t.Fatal(err)
+func assertRoutingProjection(t *testing.T, value, created account.Credential) {
+	t.Helper()
+	if value.ID != created.ID || value.Provider != created.Provider || value.Name != created.Name || value.SourceKey != created.SourceKey ||
+		value.Priority != created.Priority || value.MaxConcurrent != created.MaxConcurrent || value.MinimumRemaining != created.MinimumRemaining || value.WebTier != account.WebTierSuper ||
+		value.AuthType != created.AuthType || value.OIDCClientID != created.OIDCClientID || !value.ExpiresAt.Equal(created.ExpiresAt) {
+		t.Fatalf("routing metadata = %#v", value)
 	}
-	t.Cleanup(func() { _ = database.Close() })
-	if err := database.InitializeSchema(ctx); err != nil {
-		t.Fatal(err)
+	if value.EncryptedAccessToken != "" || value.EncryptedRefreshToken != "" || value.EncryptedCloudflareCookie != "" {
+		t.Fatalf("routing projection includes credential material: %#v", value)
 	}
-	accounts := NewAccountRepository(database)
-	models := NewModelRepository(database)
-	// Super-entitled pinned account with no capability row of its own.
-	pinned, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "pinned-super", SourceKey: "pinned-super",
-		EncryptedAccessToken: "access", AuthStatus: account.AuthStatusActive, Enabled: true,
-		BuildSuperEntitled: true, MaxConcurrent: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Another Super account that does support the model.
-	other, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "other-super", SourceKey: "other-super",
-		EncryptedAccessToken: "access", AuthStatus: account.AuthStatusActive, Enabled: true,
-		BuildSuperEntitled: true, MaxConcurrent: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	if err := models.ReplaceAccountCapabilities(ctx, other.ID, []string{"grok-super-shared"}, now); err != nil {
-		t.Fatal(err)
-	}
-
-	candidate, err := accounts.GetRoutingCandidate(ctx, pinned.ID, 0, "grok-super-shared", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !candidate.SupportsModel || !candidate.ModelCapabilityKnown {
-		t.Fatalf("Super shared model not applied to pinned candidate: %#v", candidate)
-	}
-	if account.HasRoutingSecrets(candidate.Credential) {
-		t.Fatalf("pinned candidate leaked secrets: %#v", candidate.Credential)
-	}
-}
-
-func TestGetRoutingCandidateRespectsRouteBinding(t *testing.T) {
-	ctx := context.Background()
-	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "routing-bound.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-	if err := database.InitializeSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
-	accounts := NewAccountRepository(database)
-	models := NewModelRepository(database)
-	bound, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "bound", SourceKey: "bound",
-		EncryptedAccessToken: "access", AuthStatus: account.AuthStatusActive, Enabled: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	unbound, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "unbound", SourceKey: "unbound",
-		EncryptedAccessToken: "access", AuthStatus: account.AuthStatusActive, Enabled: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	route, err := models.Create(ctx, model.Route{
-		PublicID: "public-a", Provider: account.ProviderBuild, UpstreamModel: "model-a",
-		Capability: model.CapabilityResponses, Enabled: true,
-	}, []uint64{bound.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	okCandidate, err := accounts.GetRoutingCandidate(ctx, bound.ID, route.ID, "model-a", "")
-	if err != nil || okCandidate.Credential.ID != bound.ID || !okCandidate.SupportsModel {
-		t.Fatalf("bound candidate = %#v err=%v", okCandidate, err)
-	}
-	if _, err := accounts.GetRoutingCandidate(ctx, unbound.ID, route.ID, "model-a", ""); !errorsIsNotFound(err) {
-		t.Fatalf("unbound account should be missing under route binding, err=%v", err)
-	}
-}
-
-func errorsIsNotFound(err error) bool {
-	return err != nil && (err == repository.ErrNotFound || err.Error() == repository.ErrNotFound.Error())
 }

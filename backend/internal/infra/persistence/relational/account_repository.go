@@ -2,7 +2,7 @@ package relational
 
 import (
 	"context"
-	"github.com/chenyme/grok2api/backend/internal/pkg/json"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -38,6 +38,7 @@ type quotaBreakdownJSON struct {
 }
 
 const (
+	accountUpdateBatchSize      = 500
 	accountPaidPlanSignal       = `(LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_code), ' ', ''), '_', ''), '-', ''), '+', 'plus')) IN ('super', 'supergrok', 'supergrokpro', 'supergrokheavy', 'supergroklite', 'grokpro', 'xpremium', 'xpremiumplus', 'apikey') OR LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_name), ' ', ''), '_', ''), '-', ''), '+', 'plus')) IN ('super', 'supergrok', 'supergrokpro', 'supergrokheavy', 'supergroklite', 'grokpro', 'xpremium', 'xpremiumplus', 'apikey'))`
 	accountFreePlanSignal       = `(LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_code), ' ', ''), '_', ''), '-', ''), '+', 'plus')) IN ('free', 'grokfree', 'freetier', 'basic', 'grokbasic', 'xbasic') OR LOWER(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(billing.plan_name), ' ', ''), '_', ''), '-', ''), '+', 'plus')) IN ('free', 'grokfree', 'freetier', 'basic', 'grokbasic', 'xbasic'))`
 	accountPaidBillingSignals   = `(` + accountPaidPlanSignal + ` OR billing.monthly_limit > 0 OR billing.on_demand_cap > 0 OR billing.on_demand_used > 0 OR billing.prepaid_balance > 0)`
@@ -91,7 +92,7 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 		}
 	}
 	query = applyWebAgreementFilter(query, input.Filter.Agreement)
-	query = applyWebAssociationFilter(query, input.Filter.Association)
+	query = applyAssociationFilter(query, input.Filter.Provider, input.Filter.Association)
 	if input.Filter.RestrictIDs {
 		if len(input.Filter.AccountIDs) == 0 {
 			query = query.Where("1 = 0")
@@ -102,11 +103,18 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 	if len(input.Filter.ExcludeIDs) > 0 {
 		query = query.Where("provider_accounts.id NOT IN ?", input.Filter.ExcludeIDs)
 	}
+	if input.Filter.AfterID > 0 {
+		query = query.Where("provider_accounts.id > ?", input.Filter.AfterID)
+	}
+	if input.Filter.ThroughID > 0 {
+		query = query.Where("provider_accounts.id <= ?", input.Filter.ThroughID)
+	}
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var rows []accountModel
 	query = applyStableSort(query, input.Page.Sort, map[string]sortSpec{
+		"id":        {expression: "provider_accounts.id"},
 		"name":      {expression: "LOWER(provider_accounts.name)"},
 		"type":      {expression: accountTypeSortExpression},
 		"status":    {expression: accountStatusSortExpression},
@@ -188,9 +196,8 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 }
 
 // ListRoutingCandidates 批量加载账号、额度、恢复状态和目标模型能力，避免推理热路径按账号逐条查询。
-// 返回的 Credential 为路由投影，不含加密 token 字段。
 func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error) {
-	bases, err := r.ListRoutingAccountBases(ctx, provider, quotaMode)
+	values, err := r.listRoutingCredentials(ctx, provider)
 	if err != nil {
 		return nil, err
 	}
@@ -204,18 +211,30 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 			for _, id := range boundIDs {
 				bound[id] = true
 			}
-			filtered := bases[:0]
-			for _, base := range bases {
-				if bound[base.Credential.ID] {
-					filtered = append(filtered, base)
+			filtered := values[:0]
+			for _, value := range values {
+				if bound[value.ID] {
+					filtered = append(filtered, value)
 				}
 			}
-			bases = filtered
+			values = filtered
 		}
 	}
-	ids := make([]uint64, 0, len(bases))
-	for _, base := range bases {
-		ids = append(ids, base.Credential.ID)
+	ids := make([]uint64, 0, len(values))
+	for _, value := range values {
+		ids = append(ids, value.ID)
+	}
+	billings, err := r.getRoutingBillings(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	recoveries, err := r.GetQuotaRecoveries(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	quotaWindows, err := r.getRoutingQuotaWindows(ctx, ids, provider, quotaMode)
+	if err != nil {
+		return nil, err
 	}
 	known := make(map[uint64]bool, len(ids))
 	supported := make(map[uint64]bool, len(ids))
@@ -245,29 +264,45 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 	}
 	sharedSuperBuildModel := false
 	if provider == account.ProviderBuild && len(bound) == 0 {
-		for _, base := range bases {
-			if !supported[base.Credential.ID] {
+		for _, value := range values {
+			if !supported[value.ID] {
 				continue
 			}
-			if account.IsBuildSuper(base.Credential, base.Billing) {
+			var billing *account.Billing
+			if snapshot, exists := billings[value.ID]; exists {
+				billing = &snapshot
+			}
+			if account.IsBuildSuper(value, billing) {
 				sharedSuperBuildModel = true
 				break
 			}
 		}
 	}
-	result := make([]account.RoutingCandidate, 0, len(bases))
-	for _, base := range bases {
-		capabilityKnown, supportsModel := known[base.Credential.ID], supported[base.Credential.ID]
+	result := make([]account.RoutingCandidate, 0, len(values))
+	for _, value := range values {
+		capabilityKnown, supportsModel := known[value.ID], supported[value.ID]
 		if len(bound) > 0 {
 			capabilityKnown, supportsModel = true, true
-		} else if sharedSuperBuildModel && account.IsBuildSuper(base.Credential, base.Billing) {
-			capabilityKnown, supportsModel = true, true
+		} else if sharedSuperBuildModel {
+			var billing *account.Billing
+			if snapshot, exists := billings[value.ID]; exists {
+				billing = &snapshot
+			}
+			if account.IsBuildSuper(value, billing) {
+				capabilityKnown, supportsModel = true, true
+			}
 		}
-		candidate := account.RoutingCandidate{
-			Credential: base.Credential, Billing: base.Billing, QuotaRecovery: base.QuotaRecovery, QuotaWindow: base.QuotaWindow,
-			ModelCapabilityKnown: capabilityKnown, SupportsModel: supportsModel,
+		candidate := account.RoutingCandidate{Credential: value, ModelCapabilityKnown: capabilityKnown, SupportsModel: supportsModel}
+		if billing, ok := billings[value.ID]; ok {
+			candidate.Billing = &billing
 		}
-		if block, ok := modelQuotaBlocks[base.Credential.ID]; ok {
+		if recovery, ok := recoveries[value.ID]; ok {
+			candidate.QuotaRecovery = &recovery
+		}
+		if window, ok := quotaWindows[value.ID]; ok {
+			candidate.QuotaWindow = &window
+		}
+		if block, ok := modelQuotaBlocks[value.ID]; ok {
 			candidate.ModelQuotaBlock = &block
 		}
 		result = append(result, candidate)
@@ -275,9 +310,8 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 	return result, nil
 }
 
-// ListRoutingAccountBases loads provider-level routing projections without encrypted tokens.
 func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provider account.Provider, quotaMode string) ([]account.RoutingAccountBase, error) {
-	values, err := r.listEnabledRoutingProjections(ctx, provider)
+	values, err := r.listRoutingCredentials(ctx, provider)
 	if err != nil {
 		return nil, err
 	}
@@ -339,8 +373,8 @@ func (r *AccountRepository) GetRoutingCandidate(ctx context.Context, id uint64, 
 			return account.RoutingCandidate{}, err
 		}
 		candidate.SupportsModel = capabilityCount > 0
-		// Build Super 共享模型语义：本账号无 capability 行时，若同一 provider 下任一 Super
-		// 账号支持该模型，则本 Super 账号也视为支持，与 ListRoutingCandidates 行为一致。
+		// Build Super shared-model semantics: when this account has no capability row, inherit
+		// support if any Super account in the same provider supports the model.
 		if !candidate.SupportsModel && base.Credential.Provider == account.ProviderBuild && account.IsBuildSuper(base.Credential, base.Billing) {
 			var superSupported int64
 			if err := r.db.db.WithContext(ctx).
@@ -368,53 +402,6 @@ func (r *AccountRepository) GetRoutingCandidate(ctx context.Context, id uint64, 
 	return candidate, nil
 }
 
-// routingCredentialPreload loads only non-secret credential metadata (auth type,
-// schedule fields). Encrypted token columns are never selected on the hot path.
-func routingCredentialPreload(db *gorm.DB) *gorm.DB {
-	return db.Select(
-		"account_id", "auth_type", "client_id",
-		"expires_at", "refresh_due_at", "last_refresh_at",
-		"refresh_failures", "last_refresh_error", "refresh_permanent", "updated_at",
-	)
-}
-
-func (r *AccountRepository) listEnabledRoutingProjections(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
-	var rows []accountModel
-	// Routing projection intentionally omits account_credentials encrypted columns.
-	err := r.db.db.WithContext(ctx).
-		Preload("Credential", routingCredentialPreload).
-		Preload("WebProfile").
-		Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).
-		Order("priority DESC, id ASC").Find(&rows).Error
-	if err != nil {
-		return nil, err
-	}
-	out := make([]account.Credential, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, account.StripRoutingSecrets(toAccountDomain(row)))
-	}
-	if err := r.attachRoutingEgressIdentities(ctx, provider, out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (r *AccountRepository) getRoutingProjection(ctx context.Context, id uint64) (account.Credential, error) {
-	var row accountModel
-	if err := r.db.db.WithContext(ctx).
-		Preload("Credential", routingCredentialPreload).
-		Preload("WebProfile").
-		First(&row, id).Error; err != nil {
-		return account.Credential{}, mapError(err)
-	}
-	value := account.StripRoutingSecrets(toAccountDomain(row))
-	values := []account.Credential{value}
-	if err := r.attachRoutingEgressIdentities(ctx, value.Provider, values); err != nil {
-		return account.Credential{}, err
-	}
-	return values[0], nil
-}
-
 func (r *AccountRepository) attachRoutingBaseAttachments(ctx context.Context, values []account.Credential, quotaMode string) ([]account.RoutingAccountBase, error) {
 	if len(values) == 0 {
 		return []account.RoutingAccountBase{}, nil
@@ -423,7 +410,7 @@ func (r *AccountRepository) attachRoutingBaseAttachments(ctx context.Context, va
 	for _, value := range values {
 		ids = append(ids, value.ID)
 	}
-	billings, err := r.GetBillings(ctx, ids)
+	billings, err := r.getRoutingBillings(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -431,30 +418,13 @@ func (r *AccountRepository) attachRoutingBaseAttachments(ctx context.Context, va
 	if err != nil {
 		return nil, err
 	}
-	quotaWindows := make(map[uint64]account.QuotaWindow, len(ids))
 	provider := values[0].Provider
-	if len(ids) > 0 && (provider == account.ProviderWeb || quotaMode != "") {
-		modes := make([]string, 0, 2)
-		if provider == account.ProviderWeb {
-			modes = append(modes, "weekly")
-		}
-		if quotaMode != "" {
-			modes = append(modes, quotaMode)
-		}
-		var rows []quotaWindowModel
-		if err := r.db.db.WithContext(ctx).Where("account_id IN ? AND mode IN ?", ids, modes).Order("CASE WHEN mode = 'weekly' THEN 0 ELSE 1 END").Find(&rows).Error; err != nil {
-			return nil, err
-		}
-		for _, row := range rows {
-			if _, exists := quotaWindows[row.AccountID]; !exists {
-				quotaWindows[row.AccountID] = toQuotaWindowDomain(row)
-			}
-		}
+	quotaWindows, err := r.getRoutingQuotaWindows(ctx, ids, provider, quotaMode)
+	if err != nil {
+		return nil, err
 	}
 	result := make([]account.RoutingAccountBase, 0, len(values))
 	for _, value := range values {
-		// listEnabledRoutingProjections already stripped secrets; keep this as a defensive
-		// guarantee for any future caller that passes unstripped credentials.
 		base := account.RoutingAccountBase{Credential: value}
 		if billing, ok := billings[value.ID]; ok {
 			base.Billing = &billing
@@ -466,6 +436,112 @@ func (r *AccountRepository) attachRoutingBaseAttachments(ctx context.Context, va
 			base.QuotaWindow = &window
 		}
 		result = append(result, base)
+	}
+	return result, nil
+}
+
+// getRoutingProjection loads one account's secret-less routing credential metadata.
+func (r *AccountRepository) getRoutingProjection(ctx context.Context, id uint64) (account.Credential, error) {
+	var row accountModel
+	if err := r.db.db.WithContext(ctx).
+		Preload("Credential", func(query *gorm.DB) *gorm.DB {
+			return query.Select(routingCredentialMetadataColumns)
+		}).
+		Preload("WebProfile").
+		First(&row, id).Error; err != nil {
+		return account.Credential{}, mapError(err)
+	}
+	value := toAccountDomain(row)
+	values := []account.Credential{value}
+	if err := r.attachRoutingEgressIdentities(ctx, value.Provider, values); err != nil {
+		return account.Credential{}, err
+	}
+	return values[0], nil
+}
+
+// listRoutingCredentials loads only the account state required to decide which
+// account to use. Provider secrets deliberately stay in account_credentials
+// until a selected account is hydrated for the upstream call.
+func (r *AccountRepository) listRoutingCredentials(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
+	var rows []accountModel
+	err := r.db.db.WithContext(ctx).
+		Preload("Credential", func(query *gorm.DB) *gorm.DB {
+			return query.Select(routingCredentialMetadataColumns)
+		}).
+		Preload("WebProfile").
+		Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).
+		Order("priority DESC, id ASC").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	values := make([]account.Credential, 0, len(rows))
+	for _, row := range rows {
+		values = append(values, toAccountDomain(row))
+	}
+	if err := r.attachRoutingEgressIdentities(ctx, provider, values); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+// routingCredentialMetadataColumns contains all credential fields used for
+// routing and execution decisions, but deliberately excludes the encrypted
+// access token, refresh token, and Cloudflare cookie.
+var routingCredentialMetadataColumns = []string{
+	"account_id", "auth_type", "client_id", "expires_at", "refresh_due_at", "last_refresh_at",
+	"refresh_failures", "last_refresh_error", "refresh_permanent", "updated_at",
+}
+
+var routingBillingColumns = []string{
+	"account_id", "plan_code", "plan_name", "monthly_limit", "used", "on_demand_cap", "on_demand_used", "prepaid_balance",
+	"credit_usage_percent", "is_unified_billing_user", "on_demand_enabled", "top_up_method", "usage_period_type",
+	"usage_period_start", "usage_period_end", "billing_period_start", "billing_period_end", "synced_at",
+}
+
+func (r *AccountRepository) getRoutingBillings(ctx context.Context, accountIDs []uint64) (map[uint64]account.Billing, error) {
+	result := make(map[uint64]account.Billing, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return result, nil
+	}
+	var rows []billingModel
+	if err := r.db.db.WithContext(ctx).Select(routingBillingColumns).Where("account_id IN ?", accountIDs).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		result[row.AccountID] = toRoutingBillingDomain(row)
+	}
+	return result, nil
+}
+
+var routingQuotaWindowColumns = []string{
+	"account_id", "mode", "remaining", "total", "usage_percent", "window_seconds", "reset_at", "synced_at", "source", "updated_at",
+}
+
+func (r *AccountRepository) getRoutingQuotaWindows(ctx context.Context, accountIDs []uint64, provider account.Provider, quotaMode string) (map[uint64]account.QuotaWindow, error) {
+	result := make(map[uint64]account.QuotaWindow, len(accountIDs))
+	if len(accountIDs) == 0 || (provider != account.ProviderWeb && quotaMode == "") {
+		return result, nil
+	}
+	modes := make([]string, 0, 2)
+	if provider == account.ProviderWeb {
+		modes = append(modes, "weekly")
+	}
+	if quotaMode != "" {
+		modes = append(modes, quotaMode)
+	}
+	var rows []quotaWindowModel
+	if err := r.db.db.WithContext(ctx).
+		Select(routingQuotaWindowColumns).
+		Where("account_id IN ? AND mode IN ?", accountIDs, modes).
+		Order("CASE WHEN mode = 'weekly' THEN 0 ELSE 1 END").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if _, exists := result[row.AccountID]; !exists {
+			result[row.AccountID] = toRoutingQuotaWindowDomain(row)
+		}
 	}
 	return result, nil
 }
@@ -712,11 +788,30 @@ func (r *AccountRepository) Get(ctx context.Context, id uint64) (account.Credent
 	return values[0], nil
 }
 
+// GetCredentialMaterial hydrates the encrypted provider data for one account
+// after routing has selected it. Routing candidate queries intentionally never
+// load these encrypted columns.
+func (r *AccountRepository) GetCredentialMaterial(ctx context.Context, accountID uint64, provider account.Provider) (account.CredentialMaterial, error) {
+	var row accountCredentialModel
+	if err := r.db.db.WithContext(ctx).
+		Table("account_credentials AS credential").
+		Select("credential.*").
+		Joins("JOIN provider_accounts AS account ON account.id = credential.account_id").
+		Where("credential.account_id = ? AND account.provider = ? AND account.enabled = TRUE AND account.auth_status = ?", accountID, provider, account.AuthStatusActive).
+		Take(&row).Error; err != nil {
+		return account.CredentialMaterial{}, mapError(err)
+	}
+	return toCredentialMaterialDomain(row, provider), nil
+}
+
 func (r *AccountRepository) LinkWebToBuild(ctx context.Context, webAccountID, buildAccountID uint64) error {
 	if webAccountID == 0 || buildAccountID == 0 || webAccountID == buildAccountID {
 		return repository.ErrConflict
 	}
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
 		var webAccount, buildAccount accountModel
 		if err := tx.Select("id", "provider").First(&webAccount, webAccountID).Error; err != nil {
 			return err
@@ -1272,7 +1367,7 @@ func (r *AccountRepository) markWebProfileTimestamp(ctx context.Context, id uint
 	}))
 }
 
-func (r *AccountRepository) UpdateMany(ctx context.Context, ids []uint64, updates repository.AccountUpdates) (int64, error) {
+func (r *AccountRepository) UpdateMany(ctx context.Context, providerValue account.Provider, ids []uint64, updates repository.AccountUpdates) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -1292,11 +1387,40 @@ func (r *AccountRepository) UpdateMany(ctx context.Context, ids []uint64, update
 	if len(values) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id IN ?", ids).Updates(values)
-	if result.Error == nil && result.RowsAffected > 0 {
+	var updated int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for start := 0; start < len(ids); start += accountUpdateBatchSize {
+			end := min(start+accountUpdateBatchSize, len(ids))
+			var rows []accountModel
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "provider").Where("id IN ?", ids[start:end]).Order("id ASC").Find(&rows).Error; err != nil {
+				return err
+			}
+			if len(rows) != end-start {
+				return repository.ErrAccountPoolMismatch
+			}
+			for _, row := range rows {
+				if account.Provider(row.Provider) != providerValue {
+					return repository.ErrAccountPoolMismatch
+				}
+			}
+		}
+		for start := 0; start < len(ids); start += accountUpdateBatchSize {
+			end := min(start+accountUpdateBatchSize, len(ids))
+			result := tx.Model(&accountModel{}).Where("provider = ? AND id IN ?", providerValue, ids[start:end]).Updates(values)
+			if result.Error != nil {
+				return result.Error
+			}
+			updated += result.RowsAffected
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if updated > 0 {
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged})
 	}
-	return result.RowsAffected, result.Error
+	return updated, nil
 }
 
 // UpdateEgressBindings assigns one egress node to multiple accounts of one
@@ -1371,6 +1495,9 @@ func (r *AccountRepository) listEgressBindingProviders(query *gorm.DB) ([]accoun
 
 func (r *AccountRepository) Delete(ctx context.Context, id uint64) error {
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
 		var lockedID uint64
 		if err := tx.Model(&accountModel{}).Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).Pluck("id", &lockedID).Error; err != nil {
 			return err
@@ -1395,6 +1522,9 @@ func (r *AccountRepository) DeleteMany(ctx context.Context, ids []uint64) (int64
 	}
 	var deleted int64
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
 		var lockedIDs []uint64
 		if err := tx.Model(&accountModel{}).Clauses(clause.Locking{Strength: "UPDATE"}).Where("id IN ?", ids).Pluck("id", &lockedIDs).Error; err != nil {
 			return err
@@ -1437,6 +1567,9 @@ func (r *AccountRepository) DeleteAutoCleanReauthCandidates(ctx context.Context,
 	}
 	deletedIDs := make([]uint64, 0, len(candidateIDs))
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
 		deletable, err := excludeAccountsWithActiveMediaJobs(tx, candidateIDs)
 		if err != nil {
 			return err
@@ -1526,12 +1659,17 @@ func excludeAccountsWithActiveMediaJobs(db *gorm.DB, ids []uint64) ([]uint64, er
 	return out, nil
 }
 
+// activeMediaJobStatuses lists video states that still require the account and block deletion.
+func activeMediaJobStatuses() []string {
+	return []string{string(media.StatusQueued), string(media.StatusInProgress)}
+}
+
 // rejectAccountsWithMediaJobs 仅保护仍需账号继续执行的活动视频任务。
 // completed/failed 已保存账号名称等快照，删除账号后由外键 SET NULL 保留历史。
 func rejectAccountsWithMediaJobs(db *gorm.DB, ids []uint64) error {
 	var count int64
 	if err := db.Model(&mediaJobModel{}).
-		Where("account_id IN ? AND status IN ?", ids, []string{string(media.StatusQueued), string(media.StatusInProgress)}).
+		Where("account_id IN ? AND status IN ?", ids, activeMediaJobStatuses()).
 		Count(&count).Error; err != nil {
 		return err
 	}
@@ -1539,54 +1677,6 @@ func rejectAccountsWithMediaJobs(db *gorm.DB, ids []uint64) error {
 		return fmt.Errorf("%w: 账号仍关联 %d 条排队中或进行中的视频任务，请等待任务结束后重试", repository.ErrConflict, count)
 	}
 	return nil
-}
-
-func (r *AccountRepository) DeleteAccountStatusBatch(ctx context.Context, providerValue account.Provider, status string, now time.Time, limit int) ([]uint64, int, error) {
-	if limit < 1 {
-		return []uint64{}, 0, nil
-	}
-	if status != "disabled" && status != "reauthRequired" && status != "cooldown" {
-		return nil, 0, fmt.Errorf("不支持清理账号状态 %q", status)
-	}
-	deletedIDs := make([]uint64, 0, limit)
-	candidateCount := 0
-	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var candidates []uint64
-		selection := applyAccountStatusFilter(tx.Model(&accountModel{}).Where("provider = ?", providerValue), status, now)
-		if err := selection.Order("id ASC").Limit(limit).Pluck("id", &candidates).Error; err != nil || len(candidates) == 0 {
-			return err
-		}
-		candidateCount = len(candidates)
-		if err := rejectAccountsWithMediaJobs(tx, candidates); err != nil {
-			return err
-		}
-		deletion := applyAccountStatusFilter(tx.Where("id IN ?", candidates), status, now).Delete(&accountModel{})
-		if deletion.Error != nil {
-			return deletion.Error
-		}
-		if deletion.RowsAffected == int64(len(candidates)) {
-			deletedIDs = append(deletedIDs, candidates...)
-			return nil
-		}
-		var remaining []uint64
-		if err := tx.Model(&accountModel{}).Where("id IN ?", candidates).Pluck("id", &remaining).Error; err != nil {
-			return err
-		}
-		remainingSet := make(map[uint64]struct{}, len(remaining))
-		for _, id := range remaining {
-			remainingSet[id] = struct{}{}
-		}
-		for _, id := range candidates {
-			if _, exists := remainingSet[id]; !exists {
-				deletedIDs = append(deletedIDs, id)
-			}
-		}
-		return nil
-	})
-	if err == nil && len(deletedIDs) > 0 {
-		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: providerValue})
-	}
-	return deletedIDs, candidateCount, err
 }
 
 func applyAccountStatusFilter(query *gorm.DB, status string, now time.Time) *gorm.DB {
@@ -1615,6 +1705,9 @@ const (
 	webTermsAcceptedPredicate = "EXISTS (SELECT 1 FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id AND profile.terms_accepted_at IS NOT NULL AND profile.terms_accepted_version >= ?)"
 	webBuildLinkedPredicate   = "EXISTS (SELECT 1 FROM account_provider_links link WHERE link.web_account_id = provider_accounts.id)"
 	webConsoleLinkedPredicate = "EXISTS (SELECT 1 FROM web_console_account_links link WHERE link.web_account_id = provider_accounts.id)"
+	// Build and Console filter by whether a Web link exists.
+	buildWebLinkedPredicate   = "EXISTS (SELECT 1 FROM account_provider_links link WHERE link.build_account_id = provider_accounts.id)"
+	consoleWebLinkedPredicate = "EXISTS (SELECT 1 FROM web_console_account_links link WHERE link.console_account_id = provider_accounts.id)"
 )
 
 func applyWebAgreementFilter(query *gorm.DB, agreement string) *gorm.DB {
@@ -1636,7 +1729,10 @@ func applyWebAgreementFilter(query *gorm.DB, agreement string) *gorm.DB {
 	}
 }
 
-func applyWebAssociationFilter(query *gorm.DB, association string) *gorm.DB {
+// applyAssociationFilter applies provider-specific association predicates.
+// Web supports Build, Console, and combined filters; Build and Console use
+// provider-specific foreign keys for webLinked and webUnlinked.
+func applyAssociationFilter(query *gorm.DB, providerValue, association string) *gorm.DB {
 	switch association {
 	case "buildLinked":
 		return query.Where(webBuildLinkedPredicate)
@@ -1650,6 +1746,16 @@ func applyWebAssociationFilter(query *gorm.DB, association string) *gorm.DB {
 		return query.Where(webBuildLinkedPredicate).Where(webConsoleLinkedPredicate)
 	case "allUnlinked":
 		return query.Where("NOT " + webBuildLinkedPredicate).Where("NOT " + webConsoleLinkedPredicate)
+	case "webLinked":
+		if providerValue == string(account.ProviderConsole) {
+			return query.Where(consoleWebLinkedPredicate)
+		}
+		return query.Where(buildWebLinkedPredicate)
+	case "webUnlinked":
+		if providerValue == string(account.ProviderConsole) {
+			return query.Where("NOT " + consoleWebLinkedPredicate)
+		}
+		return query.Where("NOT " + buildWebLinkedPredicate)
 	default:
 		return query
 	}
@@ -1826,11 +1932,7 @@ func (r *AccountRepository) UpdateHealth(ctx context.Context, id uint64, failure
 	}
 	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id = ?", id).Updates(updates).Error
 	if err == nil && !success {
-		var provider account.Provider
-		_ = r.db.db.WithContext(ctx).Model(&accountModel{}).Select("provider").Where("id = ?", id).Scan(&provider).Error
-		r.notifyInvalidation(ctx, repository.InvalidationEvent{
-			Kind: repository.InvalidationAccountStateChanged, Provider: provider, AccountID: id,
-		})
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, AccountID: id})
 	}
 	return err
 }
@@ -2180,13 +2282,19 @@ func (r *AccountRepository) ListStaleWebQuotaAccountIDs(ctx context.Context, bef
 func toQuotaWindowDomain(row quotaWindowModel) account.QuotaWindow {
 	var serializedBreakdown []quotaBreakdownJSON
 	_ = json.Unmarshal([]byte(row.BreakdownJSON), &serializedBreakdown)
+	result := toRoutingQuotaWindowDomain(row)
 	breakdown := make([]account.QuotaBreakdown, 0, len(serializedBreakdown))
 	for _, item := range serializedBreakdown {
 		breakdown = append(breakdown, account.QuotaBreakdown{ProductCode: item.ProductCode, UsagePercent: item.UsagePercent})
 	}
+	result.Breakdown = breakdown
+	return result
+}
+
+func toRoutingQuotaWindowDomain(row quotaWindowModel) account.QuotaWindow {
 	return account.QuotaWindow{
 		AccountID: row.AccountID, Mode: row.Mode, Remaining: row.Remaining, Total: row.Total,
-		UsagePercent: row.UsagePercent, Breakdown: breakdown, WindowSeconds: row.WindowSeconds,
+		UsagePercent: row.UsagePercent, WindowSeconds: row.WindowSeconds,
 		ResetAt: row.ResetAt, SyncedAt: row.SyncedAt, Source: account.QuotaSource(row.Source), UpdatedAt: row.UpdatedAt,
 	}
 }
