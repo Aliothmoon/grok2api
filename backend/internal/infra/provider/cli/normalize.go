@@ -14,7 +14,7 @@ func normalizeResponsesRequest(body []byte, model string) ([]byte, *responsesToo
 		return nil, nil, fmt.Errorf("解析 Responses 请求: %w", err)
 	}
 	payload["model"] = mustJSON(model)
-	normalizeBuildReasoningEffortPayload(payload)
+	normalizeBuildReasoningEffortPayload(payload, model)
 	if responseFormat, exists := payload["response_format"]; exists {
 		var text map[string]json.RawMessage
 		if raw := payload["text"]; len(raw) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
@@ -52,18 +52,19 @@ func normalizeResponsesRequest(body []byte, model string) ([]byte, *responsesToo
 }
 
 // normalizeBuildReasoningEffort maps client aliases to levels accepted by Grok Build.
-func normalizeBuildReasoningEffort(body []byte) ([]byte, error) {
+// For grok-4.5, unsupported effort "none" is lowered to "low" (the minimum supported level).
+func normalizeBuildReasoningEffort(body []byte, model string) ([]byte, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("解析 Build reasoning 请求: %w", err)
 	}
-	if !normalizeBuildReasoningEffortPayload(payload) {
+	if !normalizeBuildReasoningEffortPayload(payload, model) {
 		return body, nil
 	}
 	return json.Marshal(payload)
 }
 
-func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage) bool {
+func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, model string) bool {
 	raw, exists := payload["reasoning"]
 	if !exists || isEmptyJSON(raw) {
 		return false
@@ -76,19 +77,37 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage) bo
 	if err := json.Unmarshal(reasoning["effort"], &effort); err != nil {
 		return false
 	}
+	original := effort
 	var normalized string
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "max", "xhigh":
 		normalized = "high"
+	case "none":
+		// grok-4.5 cannot disable reasoning; map client "none" to the lowest supported tier.
+		if !isGrok45Model(model) {
+			return false
+		}
+		normalized = "low"
 	default:
 		return false
 	}
-	if effort == normalized {
+	if original == normalized {
 		return false
 	}
 	reasoning["effort"] = mustJSON(normalized)
 	payload["reasoning"] = mustJSON(reasoning)
 	return true
+}
+
+// isGrok45Model reports whether model is grok-4.5 or a grok-4.5-* effort alias
+// (optionally with a provider namespace prefix such as Build/).
+func isGrok45Model(model string) bool {
+	slug := strings.TrimSpace(model)
+	if i := strings.LastIndex(slug, "/"); i >= 0 {
+		slug = strings.TrimSpace(slug[i+1:])
+	}
+	slug = strings.ToLower(slug)
+	return slug == "grok-4.5" || strings.HasPrefix(slug, "grok-4.5-")
 }
 
 // patchReasoningTextTypes 对齐官方 CLI 的序列化后修补：Responses 上游要求

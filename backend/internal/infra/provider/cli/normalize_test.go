@@ -41,19 +41,24 @@ func TestNormalizeResponsesRequest(t *testing.T) {
 func TestNormalizeBuildReasoningEffort(t *testing.T) {
 	tests := []struct {
 		name   string
+		model  string
 		effort string
 		want   string
 	}{
-		{name: "max", effort: "max", want: "high"},
-		{name: "xhigh", effort: "xhigh", want: "high"},
-		{name: "uppercase max", effort: "MAX", want: "high"},
-		{name: "high", effort: "high", want: "high"},
-		{name: "medium", effort: "medium", want: "medium"},
+		{name: "max", model: "grok-4.5", effort: "max", want: "high"},
+		{name: "xhigh", model: "grok-4.5", effort: "xhigh", want: "high"},
+		{name: "uppercase max", model: "grok-4.5", effort: "MAX", want: "high"},
+		{name: "high", model: "grok-4.5", effort: "high", want: "high"},
+		{name: "medium", model: "grok-4.5", effort: "medium", want: "medium"},
+		{name: "grok-4.5 none to low", model: "grok-4.5", effort: "none", want: "low"},
+		{name: "Build/grok-4.5 none to low", model: "Build/grok-4.5", effort: "none", want: "low"},
+		{name: "grok-4.5-high none to low", model: "grok-4.5-high", effort: "NONE", want: "low"},
+		{name: "grok-4.3 none preserved", model: "grok-4.3", effort: "none", want: "none"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			body := []byte(`{"reasoning":{"effort":"` + test.effort + `"},"input":"hello"}`)
-			normalized, err := normalizeBuildReasoningEffort(body)
+			normalized, err := normalizeBuildReasoningEffort(body, test.model)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -66,6 +71,21 @@ func TestNormalizeBuildReasoningEffort(t *testing.T) {
 				t.Fatalf("reasoning = %#v, want %q", payload["reasoning"], test.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeResponsesRequestMapsGrok45NoneEffortToLow(t *testing.T) {
+	normalized, _, err := normalizeResponsesRequest([]byte(`{"model":"public","input":"hello","reasoning":{"effort":"none"}}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, ok := payload["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "low" {
+		t.Fatalf("reasoning = %#v, want effort=low", payload["reasoning"])
 	}
 }
 
