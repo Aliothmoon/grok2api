@@ -239,6 +239,20 @@ func TestSelectorAppliesOutOfOrderInvalidationsSafely(t *testing.T) {
 	}
 }
 
+func TestSelectorIgnoresClientKeyInvalidation(t *testing.T) {
+	selector := NewSelector(nil, nil, nil, nil, time.Hour, time.Second, time.Minute)
+	loadedAt := time.Now().UTC()
+	selector.routingBases[routingBaseCacheKey{provider: account.ProviderBuild}] = routingBaseSnapshot{loadedAt: loadedAt}
+	selector.routingOverlays[routingOverlayCacheKey{provider: account.ProviderBuild}] = routingOverlaySnapshot{loadedAt: loadedAt}
+	selector.candidates[candidateCacheKey{provider: account.ProviderBuild}] = candidateSnapshot{loadedAt: loadedAt}
+
+	selector.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationClientKeyChanged, ClientKeyID: 42})
+
+	if len(selector.routingBases) != 1 || len(selector.routingOverlays) != 1 || len(selector.candidates) != 1 {
+		t.Fatalf("client-key event invalidated selector caches: bases=%d overlays=%d candidates=%d", len(selector.routingBases), len(selector.routingOverlays), len(selector.candidates))
+	}
+}
+
 func TestSelectorScopesAccountInvalidationToCachedProvider(t *testing.T) {
 	selector := NewSelector(nil, nil, nil, nil, time.Hour, time.Second, time.Minute)
 	expiresAt := time.Now().Add(time.Hour)
