@@ -45,3 +45,7 @@ Thumbs.db
 /release/
 /.tmp/
 /tmp/
+
+# Local deploy artifacts
+/.deploy/
+

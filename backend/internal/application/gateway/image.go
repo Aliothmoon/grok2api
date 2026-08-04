@@ -168,13 +168,19 @@ func (s *Service) executeImage(
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	attemptPolicy := newRoutingAttemptPolicy(int(s.maxAttempts.Load()))
 	excluded := make(map[uint64]bool)
+	var selection *selectionSession
 	var lease *accountLease
 	var credential accountdomain.Credential
 	var response *provider.Response
 	var lastCredentialFailure *accountdomain.Credential
 	var lastCredentialError error
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
-		lease, err = s.selector.AcquireForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false, key.AccountScope())
+		if selection == nil {
+			selection, err = s.selector.beginSelectionSessionForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false, key.AccountScope())
+		}
+		if err == nil {
+			lease, err = selection.Acquire(ctx, excluded, false)
+		}
 		if err != nil {
 			errorCode := "upstream_unavailable"
 			var selectionFailure *SelectionUnavailableError
@@ -229,8 +235,11 @@ func (s *Service) executeImage(
 		}
 		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attemptPolicy.hasNext(attempt) {
 			_, _ = readRetryableBody(response.Body)
-			lease.Release()
 			delete(excluded, credential.ID)
+			if selection != nil {
+				selection.RetryAccount(credential.ID)
+			}
+			lease.Release()
 			continue
 		}
 		if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && lease.QuotaMode != "" {

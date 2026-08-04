@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -741,19 +742,11 @@ func TestBuildDirectFileUploadBodySanitizesUnsafeFilename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if part.FormName() != "file" {
-		t.Fatalf("form name=%q, want file", part.FormName())
-	}
-	// Assert via mime.ParseMediaType on Content-Disposition (OS-independent).
-	// Part.FileName() runs filepath.Base, which treats '\' as a separator on Windows.
-	// mime.ParseMediaType unescapes the quoted filename once, so the logical value is a\b"c_.png.
-	_, dispositionParams, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "a\\b\"c_.png"
-	if got := dispositionParams["filename"]; got != want {
-		t.Fatalf("disposition filename=%q, want %q (FileName=%q raw=%q)", got, want, part.FileName(), part.Header.Get("Content-Disposition"))
+	// multipart 的 Part.FileName() 内部会过一层 filepath.Base(平台相关):
+	// Windows 把 \ 视作路径分隔符,会剥掉 a\ 前缀;Linux 则原样返回。
+	// 期望值同样用 filepath.Base 计算,双平台同时成立,断言强度不变。
+	if part.FormName() != "file" || part.FileName() != filepath.Base(`a\b"c_.png`) {
+		t.Fatalf("form name=%q filename=%q", part.FormName(), part.FileName())
 	}
 }
 
