@@ -12,6 +12,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
+	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -98,6 +99,96 @@ func TestSelectorPrioritizesDueQuotaProbeOnce(t *testing.T) {
 	selector.MarkSuccess(ctx, probe)
 	if _, err := accounts.GetQuotaRecovery(ctx, probe.ID); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("quota recovery should be cleared, err = %v", err)
+	}
+}
+
+func TestSelectorQualityProbePinsAccountToRequestedEgressNode(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-egress.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	egressNodes := relational.NewEgressRepository(database)
+	firstNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "first", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "second", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	first, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "first", SourceKey: "first", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1, EgressNodeID: firstNode.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "second", SourceKey: "second", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1, EgressNodeID: secondNode.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	lease, err := selector.AcquireForKeyOnEgressNode(ctx, account.ProviderBuild, 0, "grok-test", "", "", nil, false, clientkeydomain.AccountScope{}, secondNode.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != second.ID || lease.Credential.ID == first.ID {
+		t.Fatalf("selected account=%d, want=%d on node=%d", lease.Credential.ID, second.ID, secondNode.ID)
+	}
+}
+
+func TestSelectorQualityProbeBorrowsHealthyAccountForUnavailableNode(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-egress-fallback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	egressNodes := relational.NewEgressRepository(database)
+	targetNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "target", Scope: egressdomain.ScopeBuild, Enabled: false, EncryptedProxyURL: "target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthyNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "healthy", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "healthy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	_, _, err = accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "target-reauth", SourceKey: "target-reauth", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusReauthRequired, MaxConcurrent: 1, EgressNodeID: targetNode.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "healthy", SourceKey: "healthy", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1, EgressNodeID: healthyNode.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	lease, err := selector.AcquireForKeyOnEgressNode(ctx, account.ProviderBuild, 0, "grok-test", "", "ordinary-affinity", nil, false, clientkeydomain.AccountScope{}, targetNode.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != healthy.ID {
+		t.Fatalf("selected account=%d, want borrowed healthy account=%d", lease.Credential.ID, healthy.ID)
 	}
 }
 
@@ -889,15 +980,23 @@ func TestSelectorConsumesOnlyMatchingQuotaSnapshot(t *testing.T) {
 	values := []account.RoutingCandidate{{
 		Credential: account.Credential{ID: 7}, QuotaWindow: &account.QuotaWindow{AccountID: 7, Mode: "fast", Remaining: 10},
 	}}
-	selector := &Selector{candidates: map[candidateCacheKey]candidateSnapshot{key: newCandidateSnapshot(values, routingLayerVersion{}, routingLayerVersion{}, time.Now().UTC())}}
+	selector := &Selector{candidates: map[candidateCacheKey]candidateSnapshot{key: newCandidateSnapshot(values, time.Now().UTC().Add(time.Minute))}}
 	original := selector.candidates[key].values
 	selector.ConsumeQuota(account.ProviderWeb, 7, "fast", 3)
-	window := selector.candidates[key].values[0].QuotaWindow
-	if window == nil || window.Remaining != 7 {
-		t.Fatalf("quota window = %#v", window)
-	}
 	if original[0].QuotaWindow == nil || original[0].QuotaWindow.Remaining != 10 {
 		t.Fatalf("published snapshot was mutated: %#v", original[0].QuotaWindow)
+	}
+	consumed := selector.quotaConsumptionSnapshot(account.ProviderWeb)
+	if quotaWindowExhausted(values[0], consumed) {
+		t.Fatal("partially consumed quota was treated as exhausted")
+	}
+	selector.ConsumeQuota(account.ProviderWeb, 7, "other", 100)
+	if quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb)) {
+		t.Fatal("a different quota mode affected the candidate")
+	}
+	selector.ConsumeQuota(account.ProviderWeb, 7, "fast", 7)
+	if !quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb)) {
+		t.Fatal("fully consumed quota remained schedulable")
 	}
 }
 
@@ -1264,18 +1363,6 @@ func (l *batchConcurrencyLimiter) CurrentMany(_ context.Context, keys []string) 
 	values := make(map[string]int, len(keys))
 	for _, key := range keys {
 		values[key] = l.values[key]
-	}
-	return values, nil
-}
-
-func (l *batchConcurrencyLimiter) CurrentManyAccountIDs(_ context.Context, accountIDs []uint64) (map[uint64]int, error) {
-	l.batchCalls++
-	values := make(map[uint64]int)
-	for _, id := range accountIDs {
-		key := repository.AccountConcurrencyKey(id)
-		if count := l.values[key]; count > 0 {
-			values[id] = count
-		}
 	}
 	return values, nil
 }

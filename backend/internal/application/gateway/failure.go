@@ -167,7 +167,7 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 	return failure
 }
 
-func newTransportUpstreamFailure(err error, accountID uint64, accountName string, proxyPool bool) *UpstreamFailure {
+func newTransportUpstreamFailure(err error, accountID uint64, accountName string) *UpstreamFailure {
 	code, message := "upstream_network_error", "连接上游服务失败"
 	status := http.StatusBadGateway
 	if neterrorpkg.IsResponseHeaderTimeout(err) {
@@ -175,24 +175,10 @@ func newTransportUpstreamFailure(err error, accountID uint64, accountName string
 	} else if errors.Is(err, context.DeadlineExceeded) {
 		code, message = "upstream_timeout", "上游服务响应超时"
 	}
-	// Only account-scope transport fingerprints when the selected egress is a proxy
-	// pool (ProxyPool flag or sticky account template such as Resin Default.{account}).
-	// Shared single-proxy / direct egress still uses the coarse class fingerprint so
-	// two identical network failures short-circuit the request. Same-account repeats
-	// under a pool still trip the >=2 break.
-	accountScoped := proxyPool && accountID != 0
 	return &UpstreamFailure{
 		HTTPStatus: status, Code: code, PublicMessage: message,
-		AccountID: accountID, AccountName: accountName, AccountScoped: accountScoped,
-		Fingerprint: transportFailureFingerprint(code, accountID, proxyPool), Cause: err,
+		AccountID: accountID, AccountName: accountName, Fingerprint: code, Cause: err,
 	}
-}
-
-func transportFailureFingerprint(code string, accountID uint64, proxyPool bool) string {
-	if !proxyPool || accountID == 0 {
-		return code
-	}
-	return fmt.Sprintf("%s:account:%d", code, accountID)
 }
 
 func newCredentialUpstreamFailure(err error, accountID uint64, accountName string) *UpstreamFailure {

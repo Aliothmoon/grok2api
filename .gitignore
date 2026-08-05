@@ -34,6 +34,10 @@ Thumbs.db
 *.coverprofile
 *.test
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Frontend
 /.pnpm-store/
 /frontend/node_modules/
@@ -48,4 +52,4 @@ Thumbs.db
 
 # Local deploy artifacts
 /.deploy/
-
+/Dockerfile.local

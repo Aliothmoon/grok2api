@@ -2,9 +2,11 @@ package cli
 
 import (
 	"bytes"
-	"github.com/chenyme/grok2api/backend/internal/pkg/json"
+	"encoding/json"
 	"fmt"
 	"strings"
+
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 )
 
 // normalizeResponsesRequest 改写路由字段和兼容别名，并为上游不支持的新工具协议建立请求级映射。
@@ -14,7 +16,9 @@ func normalizeResponsesRequest(body []byte, model string) ([]byte, *responsesToo
 		return nil, nil, fmt.Errorf("解析 Responses 请求: %w", err)
 	}
 	payload["model"] = mustJSON(model)
-	normalizeBuildReasoningEffortPayload(payload, model)
+	if _, err := normalizeBuildRequestPayload(payload, model); err != nil {
+		return nil, nil, err
+	}
 	if responseFormat, exists := payload["response_format"]; exists {
 		var text map[string]json.RawMessage
 		if raw := payload["text"]; len(raw) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
@@ -51,19 +55,70 @@ func normalizeResponsesRequest(body []byte, model string) ([]byte, *responsesToo
 	return normalized, compatibility, nil
 }
 
-// normalizeBuildReasoningEffort maps client aliases to levels accepted by Grok Build.
-// For grok-4.5, unsupported effort "none" is lowered to "low" (the minimum supported level).
-func normalizeBuildReasoningEffort(body []byte, model string) ([]byte, error) {
+// normalizeBuildRequest applies the stable compatibility boundary shared by Responses,
+// Chat Completions, and Anthropic Messages before the request reaches Grok Build.
+func normalizeBuildRequest(body []byte, model string) ([]byte, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("解析 Build reasoning 请求: %w", err)
+		return nil, fmt.Errorf("解析 Build 请求: %w", err)
 	}
-	if !normalizeBuildReasoningEffortPayload(payload, model) {
+	changed, err := normalizeBuildRequestPayload(payload, model)
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
 		return body, nil
 	}
 	return json.Marshal(payload)
 }
 
+func normalizeBuildRequestPayload(payload map[string]json.RawMessage, model string) (bool, error) {
+	changed := false
+	// client_metadata is a Codex transport envelope and may contain local paths,
+	// repository remotes, and installation/session identifiers. It is consumed by
+	// the HTTP boundary for cache affinity and must never cross into Grok Build.
+	if _, exists := payload["client_metadata"]; exists {
+		delete(payload, "client_metadata")
+		changed = true
+	}
+	if normalizeBuildReasoningEffortPayload(payload, model) {
+		changed = true
+	}
+	defaultsChanged, err := applyBuildResponseDefaults(payload)
+	if err != nil {
+		return false, err
+	}
+	return changed || defaultsChanged, nil
+}
+
+// applyBuildResponseDefaults mirrors the official Grok Build client boundary.
+// Explicit store=true remains a caller choice; only an absent/null value is made ZDR-safe.
+func applyBuildResponseDefaults(payload map[string]json.RawMessage) (bool, error) {
+	changed := false
+	if raw, exists := payload["store"]; !exists || isEmptyJSON(raw) {
+		payload["store"] = mustJSON(false)
+		changed = true
+	}
+
+	var includes []string
+	if raw, exists := payload["include"]; exists && !isEmptyJSON(raw) {
+		if err := json.Unmarshal(raw, &includes); err != nil {
+			return false, fmt.Errorf("解析 Build include: %w", err)
+		}
+	}
+	for _, value := range includes {
+		if value == "reasoning.encrypted_content" {
+			return changed, nil
+		}
+	}
+	includes = append(includes, "reasoning.encrypted_content")
+	payload["include"] = mustJSON(includes)
+	return true, nil
+}
+
+// normalizeBuildReasoningEffortPayload maps client aliases to levels accepted by
+// the selected Grok model. Grok 4.5 and unknown models retain the proven defensive
+// xhigh/max -> high behavior; explicitly supported xhigh models keep their value.
 func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, model string) bool {
 	raw, exists := payload["reasoning"]
 	if !exists || isEmptyJSON(raw) {
@@ -73,41 +128,44 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, mo
 	if err := json.Unmarshal(raw, &reasoning); err != nil || reasoning == nil {
 		return false
 	}
+	// CPA and the current xAI model registry both treat Composer as a model
+	// without configurable thinking levels. Preserve other reasoning controls
+	// such as summary, but never forward reasoning.effort to Composer.
+	if modeldomain.IsGrokComposerModel(model) {
+		if _, exists := reasoning["effort"]; !exists {
+			return false
+		}
+		delete(reasoning, "effort")
+		if len(reasoning) == 0 {
+			delete(payload, "reasoning")
+		} else {
+			payload["reasoning"] = mustJSON(reasoning)
+		}
+		return true
+	}
 	var effort string
 	if err := json.Unmarshal(reasoning["effort"], &effort); err != nil {
 		return false
 	}
-	original := effort
 	var normalized string
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "max", "xhigh":
-		normalized = "high"
-	case "none":
-		// grok-4.5 cannot disable reasoning; map client "none" to the lowest supported tier.
-		if !isGrok45Model(model) {
-			return false
+	case "xhigh":
+		if modeldomain.SupportsReasoningEffort(model, modeldomain.ReasoningEffortXHigh) {
+			normalized = modeldomain.ReasoningEffortXHigh
+		} else {
+			normalized = modeldomain.ReasoningEffortHigh
 		}
-		normalized = "low"
+	case "max":
+		normalized = modeldomain.ReasoningEffortHigh
 	default:
 		return false
 	}
-	if original == normalized {
+	if effort == normalized {
 		return false
 	}
 	reasoning["effort"] = mustJSON(normalized)
 	payload["reasoning"] = mustJSON(reasoning)
 	return true
-}
-
-// isGrok45Model reports whether model is grok-4.5 or a grok-4.5-* effort alias
-// (optionally with a provider namespace prefix such as Build/).
-func isGrok45Model(model string) bool {
-	slug := strings.TrimSpace(model)
-	if i := strings.LastIndex(slug, "/"); i >= 0 {
-		slug = strings.TrimSpace(slug[i+1:])
-	}
-	slug = strings.ToLower(slug)
-	return slug == "grok-4.5" || strings.HasPrefix(slug, "grok-4.5-")
 }
 
 // patchReasoningTextTypes 对齐官方 CLI 的序列化后修补：Responses 上游要求

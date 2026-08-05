@@ -154,7 +154,6 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 }
 
 func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, provider account.Provider, quotaMode, stage string) (segmentedClaimResult, error) {
-	_ = provider // retained for call-site clarity; provider is taken from the claimed credential.
 	result := segmentedClaimResult{}
 	for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
 		lease, err := s.claimAccountSlot(ctx, candidate.Credential)
@@ -171,7 +170,8 @@ func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, 
 		}
 		lease.Billing = candidate.Billing
 		lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-		result.lease = s.finalizeLease(lease, stage, true)
+		lease.selectorObservation = &selectorLeaseObservation{provider: provider, stage: stage}
+		result.lease = lease
 		return result, nil
 	}
 	return result, nil

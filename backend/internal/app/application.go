@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +37,7 @@ import (
 	cliprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/cli"
 	consoleprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/console"
 	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
+	infraqualityguard "github.com/chenyme/grok2api/backend/internal/infra/qualityguard"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	redisruntime "github.com/chenyme/grok2api/backend/internal/infra/runtime/redis"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -86,6 +89,13 @@ type Application struct {
 
 // New 完成数据库、Provider、应用服务和 HTTP 路由装配。
 func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Application, error) {
+	qualityGuardDirectory := strings.TrimSpace(os.Getenv("GROK2API_QUALITY_GUARD_DIR"))
+	qualityGuardPath := func(name string) string {
+		if qualityGuardDirectory == "" {
+			return ""
+		}
+		return filepath.Join(qualityGuardDirectory, name)
+	}
 	var database *relational.Database
 	var err error
 	switch cfg.Database.Driver {
@@ -212,7 +222,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	cliAdapter.SetReasoningReplay(reasoningReplay)
 	webAdapter := webprovider.NewAdapter(webProviderConfig(cfg), egressManager, cipher, responseRepo, mediaService)
 	webAdapter.SetLogger(logger)
-	consoleAdapter := consoleprovider.NewAdapter(consoleProviderConfig(cfg), egressManager, cipher)
+	consoleAdapter := consoleprovider.NewAdapter(consoleProviderConfig(cfg), egressManager, cipher, mediaService)
 	providers := provider.NewRegistry(cliAdapter, webAdapter, consoleAdapter)
 	if err := providers.Validate(); err != nil {
 		if runtimeStore != nil {
@@ -293,7 +303,24 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	egressService.SetClearanceManager(egressManager)
 	egressService.SetNodeProber(egressManager)
 	egressService.SetOperationsConfigInvalidator(egressManager)
+	egressManager.SetFailureProber(egressService.TestNode)
 	clientKeyService := clientkeyapp.NewService(clientKeyRepo, rateLimiter, concurrency, cfg.ClientKeyDefaults.RPMLimit, cfg.ClientKeyDefaults.MaxConcurrent, cipher)
+	qualityGuardIdentity, err := clientKeyService.EnsureQualityGuardIdentity(ctx, cfg.QualityGuard.Enabled)
+	if err != nil {
+		if runtimeStore != nil {
+			_ = runtimeStore.Close()
+		}
+		database.Close()
+		return nil, err
+	}
+	qualityGuardToken, err := infraqualityguard.Prepare(qualityGuardPath("bootstrap.json"), cfg.QualityGuard, cfg.Secrets.JWTSecret)
+	if err != nil {
+		if runtimeStore != nil {
+			_ = runtimeStore.Close()
+		}
+		database.Close()
+		return nil, err
+	}
 	auditService := auditapp.NewService(auditRepo, logger, cfg.Audit.BufferSize, cfg.Audit.BatchSize, cfg.Audit.FlushInterval.Value())
 	auditService.UpdateWriterConfig(cfg.Audit.BatchSize, cfg.Audit.FlushInterval.Value(), cfg.Audit.CommitDelay.Value())
 	auditService.UpdateLedgerConfig(auditLedgerConfig(cfg.Audit))
@@ -301,8 +328,10 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	auditService.SetDropObserver(clientKeyService.ReleaseBillingProtectionBatch)
 	dashboardService := dashboardapp.NewService(dashboardRepo)
 	selector := gateway.NewSelector(accountRepo, concurrency, sticky, providers, cfg.Routing.StickyTTL.Value(), cfg.Routing.CooldownBase.Value(), cfg.Routing.CooldownMax.Value(), cfg.Routing.CapacityWait.Value())
+	selector.SetLogger(logger)
 	selector.UpdatePreferFreeBuild(cfg.Routing.PreferFreeBuild)
 	selector.UpdateSegmentedSelector(cfg.Routing.SegmentedSelectorEnabled, cfg.Routing.SegmentedMinCandidates, cfg.Routing.SegmentedWindowSize)
+	egressManager.UpdateAccountIsolatedConnections(cfg.Routing.AccountIsolatedConnections)
 	invalidationService := invalidationapp.NewService(invalidationBus, invalidationSourceInstance(cfg), func(event repository.InvalidationEvent) {
 		selector.ApplyInvalidation(event)
 		clientKeyService.ApplyInvalidation(event)
@@ -313,6 +342,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
 	gatewayService.UpdateMarkBuildChatDeniedAsReauth(cfg.Routing.MarkBuildChatDeniedAsReauth)
 	gatewayService.SetLogger(logger)
+	egressService.SetQualityProber(gatewayService)
 	gatewayService.UpdateBuildForbiddenReauthPolicy(cfg.Accounts.MarkBuildForbiddenReauth, cfg.Accounts.BuildForbiddenReauthCodes)
 	gatewayService.UpdateRequestTimeout(cfg.Server.RequestTimeout.Value())
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
@@ -357,6 +387,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		selector.UpdateConfig(next.Routing.StickyTTL.Value(), next.Routing.CooldownBase.Value(), next.Routing.CooldownMax.Value(), next.Routing.CapacityWait.Value())
 		selector.UpdatePreferFreeBuild(next.Routing.PreferFreeBuild)
 		selector.UpdateSegmentedSelector(next.Routing.SegmentedSelectorEnabled, next.Routing.SegmentedMinCandidates, next.Routing.SegmentedWindowSize)
+		egressManager.UpdateAccountIsolatedConnections(next.Routing.AccountIsolatedConnections)
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateMarkBuildChatDeniedAsReauth(next.Routing.MarkBuildChatDeniedAsReauth)
@@ -372,18 +403,15 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	readiness := func(readyCtx context.Context) httpserver.ReadinessSnapshot {
 		return readinessSnapshot(readyCtx, startup, runtimeHealth, modelRepo, accountRepo, providers, auditService)
 	}
-	router := httpserver.New(httpserver.Dependencies{
-		Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes,
-		ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies,
-		SwaggerEnabled: cfg.Server.SwaggerEnabled, PprofEnabled: cfg.Server.PprofEnabled,
-		CacheStats: func() any { return gatewayService.CacheStats() }, ResetCacheStats: gatewayService.ResetCacheStats,
-		SelectorStats: func() any { return gatewayService.SelectionStats() }, ResetSelectorStats: gatewayService.ResetSelectionStats,
-		PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath,
-		Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService,
-		AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService,
-		Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService,
-		Egress: egressService, Updates: updateService,
-	})
+	qualityGuardProbe := egressapp.QualityProbeInput{}
+	if cfg.QualityGuard.Enabled {
+		qualityGuardProbe = egressapp.QualityProbeInput{
+			ClientKeyID: qualityGuardIdentity.ID, Model: cfg.QualityGuard.Model,
+			Prompt: infraqualityguard.ProbePrompt, Expected: infraqualityguard.ProbeExpected,
+			MaxOutputTokens: cfg.QualityGuard.MaxOutputTokens,
+		}
+	}
+	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, QualityGuardStatePath: qualityGuardPath("state.json"), QualityGuardConfigPath: qualityGuardPath("runtime-config.json"), QualityGuardToken: qualityGuardToken, QualityGuardProbe: qualityGuardProbe, Updates: updateService})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: cfg.Server.ReadTimeout.Value(), IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	return &Application{
 		logger: logger, database: database, server: server,
@@ -534,8 +562,8 @@ func (a *Application) Run(ctx context.Context) error {
 		a.quotaRecovery.Run(taskCtx)
 		return nil
 	})
-	startBackground("web_quota_refresh", func(taskCtx context.Context) error {
-		a.accounts.RunWebQuotaRefresh(taskCtx)
+	startBackground("quota_refresh", func(taskCtx context.Context) error {
+		a.accounts.RunQuotaRefresh(taskCtx)
 		return nil
 	})
 	startBackground("credential_refresh", func(taskCtx context.Context) error {
@@ -552,6 +580,10 @@ func (a *Application) Run(ctx context.Context) error {
 	})
 	startBackground("web_quota_startup_catchup", func(taskCtx context.Context) error {
 		a.runWebQuotaCatchup(taskCtx)
+		return nil
+	})
+	startBackground("console_usage_migration", func(taskCtx context.Context) error {
+		a.runConsoleUsageMigration(taskCtx)
 		return nil
 	})
 	startBackground("model_catalog_startup_catchup", func(taskCtx context.Context) error {

@@ -250,7 +250,7 @@ func appendReasoningModelAliases(items []modelListItem) []modelListItem {
 		result = append(result, item)
 	}
 	for _, item := range items {
-		for _, aliasID := range modeldomain.ReasoningAliasPublicIDs(item.ID) {
+		for _, aliasID := range modeldomain.ReasoningAliasPublicIDsForProvider(item.Provider, item.ID) {
 			if seen[aliasID] {
 				continue
 			}
@@ -364,7 +364,7 @@ func (h *Handler) generateImage(c *gin.Context) {
 		return
 	}
 	if value := bytes.TrimSpace(request.StorageOptions); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
-		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前 Grok Web Provider 不支持 storage_options")
+		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前兼容层暂不支持 storage_options")
 		return
 	}
 	count := 1
@@ -507,7 +507,7 @@ func (h *Handler) editImage(c *gin.Context) {
 		return
 	}
 	if value := bytes.TrimSpace(request.StorageOptions); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
-		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前 Grok Web Provider 不支持 storage_options")
+		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前兼容层暂不支持 storage_options")
 		return
 	}
 	model := strings.TrimSpace(request.Model)
@@ -542,8 +542,8 @@ func (h *Handler) editImage(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑缺少有效 model 或 prompt")
 		return
 	}
-	if count != 1 {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "Grok Web 图片编辑当前仅支持 n=1")
+	if count < 1 || count > 10 {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "n 必须在 1 到 10 之间")
 		return
 	}
 	partialImages := 0
@@ -572,8 +572,8 @@ func (h *Handler) editImage(c *gin.Context) {
 	if resolution == "" {
 		resolution = "1k"
 	}
-	if resolution != "1k" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "Grok Web 图片编辑当前仅支持 resolution=1k")
+	if resolution != "1k" && resolution != "2k" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "resolution 必须是 1k 或 2k")
 		return
 	}
 	clientKey, requestID, ok := requestIdentity(c)
@@ -617,11 +617,11 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		return
 	}
 	if hasJSONValue(request.Output) {
-		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前 Grok Web Provider 不支持 output.upload_url")
+		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前兼容层暂不支持 output.upload_url")
 		return
 	}
 	if hasJSONValue(request.StorageOptions) {
-		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前 Grok Web Provider 不支持 storage_options")
+		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前兼容层暂不支持 storage_options")
 		return
 	}
 	duration, err := parseVideoDuration(request.Duration)
@@ -1504,6 +1504,7 @@ type responseInputDetailsDTO struct {
 
 type responseOutputDetailsDTO struct {
 	ReasoningTokens int64 `json:"reasoning_tokens"`
+	ThinkingTokens  int64 `json:"thinking_tokens"`
 }
 
 type responseContextDetailsDTO struct {
@@ -1544,6 +1545,9 @@ func (value responseUsageDTO) toGatewayUsage(responseModel string) gateway.Usage
 	reasoning := value.OutputTokensDetails.ReasoningTokens
 	if reasoning == 0 {
 		reasoning = value.CompletionTokensDetails.ReasoningTokens
+	}
+	if reasoning == 0 {
+		reasoning = value.OutputTokensDetails.ThinkingTokens
 	}
 	return gateway.Usage{
 		InputTokens: input, CachedInputTokens: cached,

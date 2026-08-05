@@ -39,7 +39,7 @@ func benchmarkSegmentedSelector(b *testing.B, candidateCount int, enabled, force
 	}
 	selector := newSegmentedActiveTestSelector(candidateCount, limiter, nil)
 	selector.UpdateSegmentedSelector(enabled, 3000, 64)
-	selector.concurrencySnapshots = resultcache.New[[32]byte, map[uint64]int](maxConcurrencySnapshots, time.Nanosecond)
+	selector.concurrencySnapshots = resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, time.Nanosecond)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
@@ -435,8 +435,8 @@ func TestSegmentedActiveSkipsStickyPinnedAndSmallPools(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer lease.Release()
-			if observation := lease.selectorObservation; observation != nil && observation.recordSegmented {
-				t.Fatalf("non-active path marked segmented observation: %#v", observation)
+			if lease.selectorObservation != nil {
+				t.Fatalf("non-active path received observation: %#v", lease.selectorObservation)
 			}
 			if activeSegmentedCursorCount(selector) != 0 {
 				t.Fatal("non-active path advanced the segmented cursor")
@@ -475,7 +475,7 @@ func TestSegmentedActiveLifecycleRecordsFinalOutcomeOnce(t *testing.T) {
 			previous := perfmetrics.Default
 			perfmetrics.Default = registry
 			defer func() { perfmetrics.Default = previous }()
-			observation := &selectorLeaseObservation{provider: account.ProviderBuild, stage: "first_window", recordSegmented: true}
+			observation := &selectorLeaseObservation{provider: account.ProviderBuild, stage: "first_window"}
 			test.record(observation)
 			assertSegmentedMetric(t, registry.CollectAndReset(), "selector_segmented_active_upstream_total", "first_window", test.outcome, 1)
 		})
@@ -567,21 +567,6 @@ func (l *segmentedSelectiveLimiter) CurrentMany(_ context.Context, keys []string
 	for _, key := range keys {
 		if l.saturated[key] {
 			result[key] = account.DefaultMaxConcurrent
-		}
-	}
-	return result, nil
-}
-
-// CurrentManyAccountIDs is the selection hot path; record batch size for window assertions.
-func (l *segmentedSelectiveLimiter) CurrentManyAccountIDs(_ context.Context, accountIDs []uint64) (map[uint64]int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.batchSizes = append(l.batchSizes, len(accountIDs))
-	result := make(map[uint64]int)
-	for _, id := range accountIDs {
-		key := repository.AccountConcurrencyKey(id)
-		if l.saturated[key] {
-			result[id] = account.DefaultMaxConcurrent
 		}
 	}
 	return result, nil

@@ -3,13 +3,16 @@ package gateway
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -31,12 +34,22 @@ type accountLease struct {
 
 const quotaProbeLease = 5 * time.Minute
 const successPersistInterval = 30 * time.Second
-// candidateCacheSoftTTL is only a defensive refresh bound for single-node memory
-// caches; epoch (version) matching is the primary invalidation mechanism.
-const candidateCacheSoftTTL = 5 * time.Minute
+
+// Routing writes publish precise invalidation events, so the TTL is only a
+// safety net for out-of-process database changes and missed notifications.
+// Keeping a one-second TTL made large pools rebuild continuously under load.
+const candidateCacheTTL = 30 * time.Second
+const candidateCacheStaleTTL = 5 * time.Minute
+const candidateCacheRetryTTL = 5 * time.Second
+const candidateCacheStaleLogInterval = time.Minute
+const maxCandidateCacheSnapshots = 64
+const maxCandidateCacheValues = 100_000
+const maxRoutingBaseSnapshots = 8
+const maxRoutingBaseValues = 150_000
+const maxRoutingOverlaySnapshots = 64
+const maxRoutingOverlayValues = 250_000
 const concurrencySnapshotTTL = 25 * time.Millisecond
 const maxConcurrencySnapshots = 256
-const routingBasePointLoadTimeout = 3 * time.Second
 
 const modelAccessDeniedCooldown = 5 * time.Minute
 
@@ -51,22 +64,34 @@ type quotaRecoveryHints struct {
 	Billing *account.Billing
 }
 
+type quotaConsumptionKey struct {
+	provider  account.Provider
+	accountID uint64
+	mode      string
+}
+
+type accountQuotaConsumptionKey struct {
+	accountID uint64
+	mode      string
+}
+
 type candidateSnapshot struct {
 	values     []account.RoutingCandidate
 	byAccount  map[uint64]int
-	baseGen    routingLayerVersion
-	overlayGen routingLayerVersion
-	loadedAt   time.Time
+	expiresAt  time.Time
+	staleUntil time.Time
+	lastAccess time.Time
 }
 
-func newCandidateSnapshot(values []account.RoutingCandidate, baseGen, overlayGen routingLayerVersion, loadedAt time.Time) candidateSnapshot {
+func newCandidateSnapshot(values []account.RoutingCandidate, expiresAt time.Time) candidateSnapshot {
 	byAccount := make(map[uint64]int, len(values))
 	for index, value := range values {
 		if _, exists := byAccount[value.Credential.ID]; !exists {
 			byAccount[value.Credential.ID] = index
 		}
 	}
-	return candidateSnapshot{values: values, byAccount: byAccount, baseGen: baseGen, overlayGen: overlayGen, loadedAt: loadedAt}
+	now := time.Now().UTC()
+	return candidateSnapshot{values: values, byAccount: byAccount, expiresAt: expiresAt, staleUntil: expiresAt.Add(candidateCacheStaleTTL), lastAccess: now}
 }
 
 type candidateCacheKey struct {
@@ -93,15 +118,19 @@ type routingLayerVersion struct {
 }
 
 type routingBaseSnapshot struct {
-	values   []account.RoutingAccountBase
-	version  routingLayerVersion
-	loadedAt time.Time
+	values     []account.RoutingAccountBase
+	version    routingLayerVersion
+	expiresAt  time.Time
+	staleUntil time.Time
+	lastAccess time.Time
 }
 
 type routingOverlaySnapshot struct {
-	value    account.RoutingOverlaySnapshot
-	version  routingLayerVersion
-	loadedAt time.Time
+	value      account.RoutingOverlaySnapshot
+	version    routingLayerVersion
+	expiresAt  time.Time
+	staleUntil time.Time
+	lastAccess time.Time
 }
 
 type SelectionUnavailableReason string
@@ -238,10 +267,15 @@ type Selector struct {
 	configMu               sync.RWMutex
 	candidateMu            sync.Mutex
 	selectionMu            sync.RWMutex
+	quotaMu                sync.RWMutex
+	staleLogMu             sync.Mutex
+	logger                 *slog.Logger
 	leaseWakeMu            sync.Mutex
 	leaseWake              chan struct{}
 	lastSelectedAt         map[uint64]time.Time
 	lastSuccessAt          map[uint64]time.Time
+	quotaConsumed          map[quotaConsumptionKey]int
+	staleFallbackLoggedAt  map[string]time.Time
 	candidates             map[candidateCacheKey]candidateSnapshot
 	routingBases           map[routingBaseCacheKey]routingBaseSnapshot
 	routingOverlays        map[routingOverlayCacheKey]routingOverlaySnapshot
@@ -251,64 +285,10 @@ type Selector struct {
 	baseProviderVersion    map[account.Provider]uint64
 	overlayProviderVersion map[account.Provider]uint64
 	candidateLoads         singleflight.Group
-	concurrencySnapshots   *resultcache.Cache[[32]byte, map[uint64]int]
-	cacheStats             routingCacheStats
-	selectionStats         *selectionStatsStore
+	concurrencySnapshots   *resultcache.Cache[[32]byte, map[string]int]
 	tierOrders             interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
-}
-
-// RoutingCacheLayerStats is a snapshot of hit/miss/load counters for one cache layer.
-type RoutingCacheLayerStats struct {
-	Hits     uint64   `json:"hits"`
-	Misses   uint64   `json:"misses"`
-	Loads    uint64   `json:"loads"`
-	Patches  uint64   `json:"patches,omitempty"`
-	Rebuilds uint64   `json:"rebuilds,omitempty"`
-	HitRatio *float64 `json:"hit_ratio"`
-}
-
-// RoutingCacheStats is exposed via /debug/cache/stats when pprof is enabled.
-type RoutingCacheStats struct {
-	Assembled    RoutingCacheLayerStats `json:"assembled"`
-	Base         RoutingCacheLayerStats `json:"base"`
-	Overlay      RoutingCacheLayerStats `json:"overlay"`
-	Invalidation struct {
-		TokenOnlySkipped uint64 `json:"token_only_skipped"`
-		BaseEvents       uint64 `json:"base_events"`
-		OverlayEvents    uint64 `json:"overlay_events"`
-		BulkRebuilds     uint64 `json:"bulk_rebuilds"`
-		AssembledPatches uint64 `json:"assembled_patches"`
-		OverlayPatches   uint64 `json:"overlay_patches"`
-	} `json:"invalidation"`
-	Sizes struct {
-		AssembledEntries int            `json:"assembled_entries"`
-		BaseSnapshots    int            `json:"base_snapshots"`
-		OverlaySnapshots int            `json:"overlay_snapshots"`
-		BaseAccounts     map[string]int `json:"base_accounts_by_provider,omitempty"`
-	} `json:"sizes"`
-}
-
-type routingCacheStats struct {
-	assembledHits, assembledMisses, assembledLoads atomic.Uint64
-	baseHits, baseMisses, baseLoads                atomic.Uint64
-	basePatches, baseRebuilds                      atomic.Uint64
-	overlayHits, overlayMisses, overlayLoads       atomic.Uint64
-	overlayPatches                                 atomic.Uint64
-	assembledPatches                               atomic.Uint64
-	tokenOnlySkipped, baseEvents, overlayEvents    atomic.Uint64
-	bulkRebuilds                                   atomic.Uint64
-}
-
-func layerStats(hits, misses, loads, patches, rebuilds uint64) RoutingCacheLayerStats {
-	stats := RoutingCacheLayerStats{Hits: hits, Misses: misses, Loads: loads, Patches: patches, Rebuilds: rebuilds}
-	total := hits + misses
-	if total > 0 {
-		ratio := float64(hits) / float64(total)
-		stats.HitRatio = &ratio
-	}
-	return stats
 }
 
 func NewSelector(accounts repository.AccountRepository, concurrency repository.ConcurrencyLimiter, sticky repository.StickySessionRepository, tierOrders interface {
@@ -318,119 +298,15 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[uint64]int](maxConcurrencySnapshots, concurrencySnapshotTTL), selectionStats: newSelectionStatsStore()}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
-// CacheStats returns atomic counters and current in-memory cache sizes.
-func (s *Selector) CacheStats() RoutingCacheStats {
-	if s == nil {
-		return RoutingCacheStats{}
+// SetLogger wires the application logger into routing degradation diagnostics.
+// It is intended to be called during startup before the selector serves traffic.
+func (s *Selector) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		s.logger = logger
 	}
-	out := RoutingCacheStats{
-		Assembled: layerStats(s.cacheStats.assembledHits.Load(), s.cacheStats.assembledMisses.Load(), s.cacheStats.assembledLoads.Load(), s.cacheStats.assembledPatches.Load(), 0),
-		Base:      layerStats(s.cacheStats.baseHits.Load(), s.cacheStats.baseMisses.Load(), s.cacheStats.baseLoads.Load(), s.cacheStats.basePatches.Load(), s.cacheStats.baseRebuilds.Load()),
-		Overlay:   layerStats(s.cacheStats.overlayHits.Load(), s.cacheStats.overlayMisses.Load(), s.cacheStats.overlayLoads.Load(), s.cacheStats.overlayPatches.Load(), 0),
-	}
-	out.Invalidation.TokenOnlySkipped = s.cacheStats.tokenOnlySkipped.Load()
-	out.Invalidation.BaseEvents = s.cacheStats.baseEvents.Load()
-	out.Invalidation.OverlayEvents = s.cacheStats.overlayEvents.Load()
-	out.Invalidation.BulkRebuilds = s.cacheStats.bulkRebuilds.Load()
-	out.Invalidation.AssembledPatches = s.cacheStats.assembledPatches.Load()
-	out.Invalidation.OverlayPatches = s.cacheStats.overlayPatches.Load()
-	s.candidateMu.Lock()
-	out.Sizes.AssembledEntries = len(s.candidates)
-	out.Sizes.BaseSnapshots = len(s.routingBases)
-	out.Sizes.OverlaySnapshots = len(s.routingOverlays)
-	if len(s.routingBases) > 0 {
-		out.Sizes.BaseAccounts = make(map[string]int, len(s.routingBases))
-		for key, snap := range s.routingBases {
-			out.Sizes.BaseAccounts[string(key.provider)+"/"+key.quotaMode] = len(snap.values)
-		}
-	}
-	s.candidateMu.Unlock()
-	return out
-}
-
-// ResetCacheStats zeroes hit/miss/load counters (debug sampling helper).
-func (s *Selector) ResetCacheStats() {
-	if s == nil {
-		return
-	}
-	s.cacheStats.assembledHits.Store(0)
-	s.cacheStats.assembledMisses.Store(0)
-	s.cacheStats.assembledLoads.Store(0)
-	s.cacheStats.baseHits.Store(0)
-	s.cacheStats.baseMisses.Store(0)
-	s.cacheStats.baseLoads.Store(0)
-	s.cacheStats.basePatches.Store(0)
-	s.cacheStats.baseRebuilds.Store(0)
-	s.cacheStats.overlayHits.Store(0)
-	s.cacheStats.overlayMisses.Store(0)
-	s.cacheStats.overlayLoads.Store(0)
-	s.cacheStats.overlayPatches.Store(0)
-	s.cacheStats.assembledPatches.Store(0)
-	s.cacheStats.tokenOnlySkipped.Store(0)
-	s.cacheStats.baseEvents.Store(0)
-	s.cacheStats.overlayEvents.Store(0)
-	s.cacheStats.bulkRebuilds.Store(0)
-}
-
-// SelectionStats returns process-local account selection business metrics.
-func (s *Selector) SelectionStats(topN int) SelectionStatsView {
-	if s == nil || s.selectionStats == nil {
-		return SelectionStatsView{ByProvider: map[string]SelectionProviderStats{}}
-	}
-	return s.selectionStats.Snapshot(topN)
-}
-
-// ResetSelectionStats clears account selection business metrics.
-func (s *Selector) ResetSelectionStats() {
-	if s == nil || s.selectionStats == nil {
-		return
-	}
-	s.selectionStats.Reset()
-}
-
-// finalizeLease attaches selection observation + claim counters for a lease returned to callers.
-// Temporary internal claims that are released before return are intentionally not counted.
-// stage keeps the raw path label (e.g. first_window / heap) for observation and perfmetrics;
-// selection business stats store a normalized path via normalizeSelectionPath.
-func (s *Selector) finalizeLease(lease *accountLease, stage string, recordSegmented bool) *accountLease {
-	if lease == nil {
-		return nil
-	}
-	if stage == "" {
-		stage = selectionPathHeap
-	}
-	statsPath := normalizeSelectionPath(stage)
-	if s != nil && s.selectionStats == nil {
-		s.selectionStats = newSelectionStatsStore()
-	}
-	var stats *selectionStatsStore
-	if s != nil {
-		stats = s.selectionStats
-	}
-	if lease.selectorObservation == nil {
-		lease.selectorObservation = &selectorLeaseObservation{
-			provider:        lease.Credential.Provider,
-			accountID:       lease.Credential.ID,
-			stage:           stage,
-			stats:           stats,
-			recordSegmented: recordSegmented,
-		}
-	} else {
-		lease.selectorObservation.provider = lease.Credential.Provider
-		lease.selectorObservation.accountID = lease.Credential.ID
-		lease.selectorObservation.stage = stage
-		lease.selectorObservation.stats = stats
-		if recordSegmented {
-			lease.selectorObservation.recordSegmented = true
-		}
-	}
-	if stats != nil {
-		stats.recordClaim(lease.Credential.Provider, lease.Credential.ID, lease.Credential.Name, statsPath)
-	}
-	return lease
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -473,14 +349,34 @@ func (s *Selector) preferFreeBuildEnabled() bool {
 }
 
 func (s *Selector) Acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
-	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, clientkeydomain.AccountScope{})
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, clientkeydomain.AccountScope{}, 0)
 }
 
 func (s *Selector) AcquireForKey(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, scope clientkeydomain.AccountScope) (*accountLease, error) {
-	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope)
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, 0)
 }
 
-func (s *Selector) acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, requestedScope clientkeydomain.AccountScope) (lease *accountLease, err error) {
+// AcquireForKeyOnEgressNode is reserved for administrator probes. It prefers a
+// credential bound to the requested node, then borrows any schedulable
+// credential when the node's own accounts are unavailable. The request layer
+// still forces the physical call through nodeID.
+func (s *Selector) AcquireForKeyOnEgressNode(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, scope clientkeydomain.AccountScope, nodeID uint64) (*accountLease, error) {
+	if nodeID == 0 {
+		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: scope}
+	}
+	lease, err := s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, nodeID)
+	if err == nil {
+		return lease, nil
+	}
+	var unavailable *SelectionUnavailableError
+	if !errors.As(err, &unavailable) {
+		return nil, err
+	}
+	// Probe borrowing must not create or reuse ordinary sticky affinity.
+	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, "", excluded, allowQuotaProbe, scope, 0)
+}
+
+func (s *Selector) acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, requestedScope clientkeydomain.AccountScope, forcedEgressNodeID uint64) (lease *accountLease, err error) {
 	accountScope, scopeValid := clientkeydomain.NormalizeAccountScope(requestedScope)
 	defer annotateSelectionAccountScope(&err, accountScope)
 	if !scopeValid || !accountScope.AllowsProvider(provider) {
@@ -492,6 +388,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	if err != nil {
 		return nil, err
 	}
+	quotaConsumed := s.quotaConsumptionSnapshot(provider)
 	// 仅保留候选下标，避免每个请求复制包含凭据、计费和额度结构的完整账号切片。
 	normalCandidates := make([]int, 0, len(values))
 	probeCandidates := make([]int, 0, len(values))
@@ -503,6 +400,9 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	var earliestRetry time.Time
 	for index, candidate := range values {
 		value := candidate.Credential
+		if forcedEgressNodeID != 0 && value.EgressNodeID != forcedEgressNodeID {
+			continue
+		}
 		if !accountScopeAllowsCandidate(provider, accountScope, candidate) {
 			continue
 		}
@@ -540,7 +440,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			quotaCandidates++
 			continue
 		}
-		if candidate.QuotaWindow != nil && candidate.QuotaWindow.Remaining <= 0 {
+		if quotaWindowExhausted(candidate, quotaConsumed) {
 			quotaCandidates++
 			if candidate.QuotaWindow.ResetAt != nil {
 				earliestRetry = earlierFuture(earliestRetry, *candidate.QuotaWindow.ResetAt, now)
@@ -594,7 +494,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			lease.QuotaProbe = true
 			lease.QuotaProbeKind = candidate.QuotaRecovery.Kind
 			lease.Billing = candidate.Billing
-			return s.finalizeLease(lease, selectionPathProbe, false), nil
+			return lease, nil
 		}
 		if len(normalCandidates) == 0 && staleClaims > 0 && capacityMisses == 0 {
 			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
@@ -623,7 +523,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 					if acquireErr == nil {
 						lease.Billing = candidate.Billing
 						lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-						return s.finalizeLease(lease, selectionPathSticky, false), nil
+						return lease, nil
 					}
 					if errors.Is(acquireErr, errRoutingCredentialStale) {
 						_ = s.sticky.DeleteByAccount(ctx, stickyID)
@@ -659,7 +559,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			}
 			lease.Billing = candidate.Billing
 			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-			return s.finalizeLease(lease, selectionPathStickyBorrow, false), nil
+			return lease, nil
 		}
 		return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
 	}
@@ -692,9 +592,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 				capacityMisses++
 				continue
 			}
-			path := selectionPathHeap
 			if stickyKey != "" {
-				path = selectionPathStickyBind
 				stickyTTL, _, _, _ := s.routingConfig()
 				boundID, bindErr := s.sticky.Bind(ctx, stickyKey, candidate.Credential.ID, currentTime, currentTime.Add(stickyTTL))
 				if bindErr != nil {
@@ -708,7 +606,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 							lease.Release()
 							boundLease.Billing = boundCandidate.Billing
 							boundLease.QuotaMode = effectiveQuotaMode(boundCandidate, quotaMode)
-							return s.finalizeLease(boundLease, selectionPathSticky, false), nil
+							return boundLease, nil
 						}
 						if errors.Is(boundErr, errRoutingCredentialStale) {
 							_ = s.sticky.DeleteByAccount(ctx, boundID)
@@ -721,7 +619,6 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 							return nil, boundErr
 						}
 						// 已绑定账号满载时保留原绑定，本次请求使用已获取的临时账号。
-						path = selectionPathStickyBorrow
 					} else if err := s.sticky.Set(ctx, stickyKey, candidate.Credential.ID, currentTime.Add(stickyTTL)); err != nil {
 						lease.Release()
 						return nil, fmt.Errorf("重建会话粘滞状态: %w", err)
@@ -730,7 +627,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			}
 			lease.Billing = candidate.Billing
 			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-			return s.finalizeLease(lease, path, false), nil
+			return lease, nil
 		}
 		if staleClaims > 0 && capacityMisses == 0 {
 			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
@@ -773,7 +670,6 @@ func isSelectionUnavailable(err error, reason SelectionUnavailableReason) bool {
 }
 
 // AcquirePinned 为 previous_response_id 等账号归属请求获取指定账号租约。
-// 优先点查单账号投影，避免加载整个 enabled 池。
 func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string, inference bool) (*accountLease, error) {
 	return s.acquirePinned(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode, inference, clientkeydomain.AccountScope{})
 }
@@ -789,106 +685,83 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
 	}
 	now := time.Now().UTC()
-	candidate, err := s.loadPinnedCandidate(ctx, provider, accountID, modelRouteID, upstreamModel, quotaMode)
+	values, err := s.loadCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, now)
 	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
-			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
-		}
 		return nil, err
 	}
-	if !accountScopeAllowsCandidate(provider, accountScope, candidate) {
-		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
-	}
-	value := candidate.Credential
-	if value.ID != accountID || value.Provider != provider {
-		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
-	}
-	if !value.Enabled || value.AuthStatus != account.AuthStatusActive {
-		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
-	}
-	if inference {
-		if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
-			return nil, &SelectionUnavailableError{Reason: SelectionUnsupportedModel}
+	quotaConsumed := s.quotaConsumptionSnapshot(provider)
+	for _, candidate := range values {
+		value := candidate.Credential
+		if value.ID != accountID {
+			continue
 		}
-		if candidate.ModelQuotaBlock != nil && now.Before(candidate.ModelQuotaBlock.CooldownUntil) {
-			return nil, &SelectionUnavailableError{Reason: SelectionModelCooling, RetryAfter: retryDelay(now, candidate.ModelQuotaBlock.CooldownUntil)}
+		if !accountScopeAllowsCandidate(provider, accountScope, candidate) {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
-		if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
-			return nil, &SelectionUnavailableError{Reason: SelectionCooling, RetryAfter: retryDelay(now, *value.CooldownUntil)}
+		if !value.Enabled || value.AuthStatus != account.AuthStatusActive {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
-		if recovery := candidate.QuotaRecovery; recovery != nil && recovery.Status != account.QuotaRecoveryStatusActive {
-			if recovery.NextProbeAt == nil || now.Before(*recovery.NextProbeAt) {
+		if inference {
+			if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
+				return nil, &SelectionUnavailableError{Reason: SelectionUnsupportedModel}
+			}
+			if candidate.ModelQuotaBlock != nil && now.Before(candidate.ModelQuotaBlock.CooldownUntil) {
+				return nil, &SelectionUnavailableError{Reason: SelectionModelCooling, RetryAfter: retryDelay(now, candidate.ModelQuotaBlock.CooldownUntil)}
+			}
+			if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+				return nil, &SelectionUnavailableError{Reason: SelectionCooling, RetryAfter: retryDelay(now, *value.CooldownUntil)}
+			}
+			if recovery := candidate.QuotaRecovery; recovery != nil && recovery.Status != account.QuotaRecoveryStatusActive {
+				if recovery.NextProbeAt == nil || now.Before(*recovery.NextProbeAt) {
+					var retryAfter time.Duration
+					if recovery.NextProbeAt != nil {
+						retryAfter = retryDelay(now, *recovery.NextProbeAt)
+					}
+					return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted, RetryAfter: retryAfter}
+				}
+				lease, err := s.acquirePinnedCapacity(ctx, value)
+				if err != nil {
+					if errors.Is(err, errRoutingCredentialStale) {
+						return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+					}
+					return nil, err
+				}
+				claimed, err := s.accounts.ClaimQuotaProbe(ctx, value.ID, now, now.Add(quotaProbeLease))
+				if err != nil || !claimed {
+					lease.Release()
+					if err != nil {
+						return nil, err
+					}
+					return nil, fmt.Errorf("绑定的上游账号恢复探测已被占用")
+				}
+				lease.QuotaProbe = true
+				lease.QuotaProbeKind = recovery.Kind
+				lease.Billing = candidate.Billing
+				return lease, nil
+			}
+			if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
+				return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted}
+			}
+			if quotaWindowExhausted(candidate, quotaConsumed) {
 				var retryAfter time.Duration
-				if recovery.NextProbeAt != nil {
-					retryAfter = retryDelay(now, *recovery.NextProbeAt)
+				if candidate.QuotaWindow.ResetAt != nil {
+					retryAfter = retryDelay(now, *candidate.QuotaWindow.ResetAt)
 				}
 				return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted, RetryAfter: retryAfter}
 			}
-			lease, err := s.acquirePinnedCapacity(ctx, value)
-			if err != nil {
-				if errors.Is(err, errRoutingCredentialStale) {
-					return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
-				}
-				return nil, err
-			}
-			claimed, err := s.accounts.ClaimQuotaProbe(ctx, value.ID, now, now.Add(quotaProbeLease))
-			if err != nil || !claimed {
-				lease.Release()
-				if err != nil {
-					return nil, err
-				}
-				return nil, fmt.Errorf("绑定的上游账号恢复探测已被占用")
-			}
-			lease.QuotaProbe = true
-			lease.QuotaProbeKind = recovery.Kind
-			lease.Billing = candidate.Billing
-			return s.finalizeLease(lease, selectionPathProbe, false), nil
 		}
-		if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
-			return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted}
-		}
-		if candidate.QuotaWindow != nil && candidate.QuotaWindow.Remaining <= 0 {
-			var retryAfter time.Duration
-			if candidate.QuotaWindow.ResetAt != nil {
-				retryAfter = retryDelay(now, *candidate.QuotaWindow.ResetAt)
-			}
-			return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted, RetryAfter: retryAfter}
-		}
-	}
-	lease, err = s.acquirePinnedCapacity(ctx, value)
-	if err != nil {
-		if errors.Is(err, errRoutingCredentialStale) {
-			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
-		}
-		return nil, err
-	}
-	lease.Billing = candidate.Billing
-	lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-	return s.finalizeLease(lease, selectionPathPinned, false), nil
-}
-
-func (s *Selector) loadPinnedCandidate(ctx context.Context, provider account.Provider, accountID, modelRouteID uint64, upstreamModel, quotaMode string) (account.RoutingCandidate, error) {
-	if lookup, ok := s.accounts.(repository.RoutingAccountLookup); ok {
-		candidate, err := lookup.GetRoutingCandidate(ctx, accountID, modelRouteID, upstreamModel, quotaMode)
+		lease, err := s.acquirePinnedCapacity(ctx, value)
 		if err != nil {
-			return account.RoutingCandidate{}, err
+			if errors.Is(err, errRoutingCredentialStale) {
+				return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+			}
+			return nil, err
 		}
-		if candidate.Credential.Provider != provider {
-			return account.RoutingCandidate{}, repository.ErrNotFound
-		}
-		return candidate, nil
+		lease.Billing = candidate.Billing
+		lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+		return lease, nil
 	}
-	// Fallback for fakes without point lookup: scan cached/assembled candidates only after a pool load.
-	values, err := s.loadCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, time.Now().UTC())
-	if err != nil {
-		return account.RoutingCandidate{}, err
-	}
-	for _, candidate := range values {
-		if candidate.Credential.ID == accountID {
-			return candidate, nil
-		}
-	}
-	return account.RoutingCandidate{}, repository.ErrNotFound
+	return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 }
 
 func accountScopeAllowsCandidate(provider account.Provider, scope clientkeydomain.AccountScope, candidate account.RoutingCandidate) bool {
@@ -979,7 +852,7 @@ func (s *Selector) markFreeQuotaExhaustedAt(ctx context.Context, credential acco
 		return err
 	}
 	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
-	s.invalidateAccount(credential.Provider, credential.ID)
+	s.invalidateCandidates(credential.Provider)
 	return nil
 }
 
@@ -997,10 +870,9 @@ func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential accou
 	_ = s.accounts.UpsertModelQuotaBlock(ctx, account.ModelQuotaBlock{
 		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "model_quota_depleted", CooldownUntil: until, UpdatedAt: time.Now().UTC(),
 	})
-	// Model quota blocks are overlay-scoped; still account-known so drop assembled without bulk base clear.
-	s.ApplyInvalidation(repository.InvalidationEvent{
-		Kind: repository.InvalidationAccountModelQuotaChanged, Provider: credential.Provider, AccountID: credential.ID, UpstreamModel: upstreamModel,
-	})
+	// The model block makes affected bindings ineligible and they are rebound on
+	// the next request. Preserve unrelated model/session affinity for this account.
+	s.invalidateCandidates(credential.Provider)
 }
 
 // MarkModelAccessDenied isolates a permission failure to the rejected model.
@@ -1021,10 +893,7 @@ func (s *Selector) MarkModelAccessDenied(ctx context.Context, credential account
 	}); err != nil {
 		return err
 	}
-	// Model access denials are overlay-scoped; keep account-known layered invalidation.
-	s.ApplyInvalidation(repository.InvalidationEvent{
-		Kind: repository.InvalidationAccountModelQuotaChanged, Provider: credential.Provider, AccountID: credential.ID, UpstreamModel: upstreamModel,
-	})
+	s.evictCandidate(credential.Provider, credential.ID)
 	return nil
 }
 
@@ -1042,7 +911,7 @@ func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential acc
 				return err
 			}
 			_ = s.sticky.DeleteByAccount(ctx, credential.ID)
-			s.invalidateAccount(credential.Provider, credential.ID)
+			s.invalidateCandidates(credential.Provider)
 			return nil
 		}
 	}
@@ -1051,69 +920,79 @@ func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential acc
 
 // MarkQuotaStateChanged 在 Billing 探测改变持久化额度状态后更新对应账号的候选快照。
 // 未提供账号 ID 时保留全量失效语义，供无法确定变更范围的调用方使用。
-// 有账号 ID 时走 fork 的账号级 layered invalidation（不整 Provider 清空）。
 func (s *Selector) MarkQuotaStateChanged(provider account.Provider, accountIDs ...uint64) {
 	if len(accountIDs) == 0 {
 		s.invalidateCandidates(provider)
 		return
 	}
 	for _, accountID := range accountIDs {
-		if accountID == 0 {
-			continue
-		}
-		s.invalidateAccount(provider, accountID)
+		s.clearQuotaConsumptionAccount(provider, accountID)
+		s.evictCandidate(provider, accountID)
 	}
 }
 
-// ConsumeQuota 将成功请求的本地额度变化应用到候选快照，避免为单账号变化清空整个 Provider 缓存。
+// ConsumeQuota records a small local delta instead of Copy-on-Write cloning
+// every cached candidate/base slice. Selection snapshots remain immutable for
+// concurrent requests, while the next request observes the consumed amount.
 func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mode string, amount int) {
 	if accountID == 0 || mode == "" || mode == "weekly" || amount <= 0 {
 		return
 	}
-	s.candidateMu.Lock()
-	defer s.candidateMu.Unlock()
-	for key, snapshot := range s.candidates {
-		if key.provider != provider {
-			continue
-		}
-		index, found := snapshot.byAccount[accountID]
-		if !found || index >= len(snapshot.values) {
-			continue
-		}
-		candidate := snapshot.values[index]
-		if candidate.QuotaWindow == nil || candidate.QuotaWindow.Mode != mode {
-			continue
-		}
-		next := append([]account.RoutingCandidate(nil), snapshot.values...)
-		window := *next[index].QuotaWindow
-		window.Remaining = max(0, window.Remaining-amount)
-		window.UpdatedAt = time.Now().UTC()
-		next[index].QuotaWindow = &window
-		snapshot.values = next
-		s.candidates[key] = snapshot
+	s.quotaMu.Lock()
+	if s.quotaConsumed == nil {
+		s.quotaConsumed = make(map[quotaConsumptionKey]int)
 	}
-	for key, snapshot := range s.routingBases {
-		if key.provider != provider {
-			continue
+	key := quotaConsumptionKey{provider: provider, accountID: accountID, mode: mode}
+	s.quotaConsumed[key] += amount
+	s.quotaMu.Unlock()
+}
+
+func (s *Selector) quotaConsumptionSnapshot(provider account.Provider) map[accountQuotaConsumptionKey]int {
+	s.quotaMu.RLock()
+	if len(s.quotaConsumed) == 0 {
+		s.quotaMu.RUnlock()
+		return nil
+	}
+	result := make(map[accountQuotaConsumptionKey]int)
+	for key, amount := range s.quotaConsumed {
+		if key.provider == provider {
+			result[accountQuotaConsumptionKey{accountID: key.accountID, mode: key.mode}] = amount
 		}
-		index := -1
-		for candidateIndex, base := range snapshot.values {
-			if base.Credential.ID == accountID {
-				index = candidateIndex
-				break
+	}
+	s.quotaMu.RUnlock()
+	return result
+}
+
+func quotaWindowExhausted(candidate account.RoutingCandidate, consumed map[accountQuotaConsumptionKey]int) bool {
+	if candidate.QuotaWindow == nil {
+		return false
+	}
+	remaining := candidate.QuotaWindow.Remaining - consumed[accountQuotaConsumptionKey{accountID: candidate.Credential.ID, mode: candidate.QuotaWindow.Mode}]
+	return remaining <= 0
+}
+
+func (s *Selector) clearQuotaConsumption(provider account.Provider) {
+	s.quotaMu.Lock()
+	if provider == "" {
+		clear(s.quotaConsumed)
+	} else {
+		for key := range s.quotaConsumed {
+			if key.provider == provider {
+				delete(s.quotaConsumed, key)
 			}
 		}
-		if index < 0 || snapshot.values[index].QuotaWindow == nil || snapshot.values[index].QuotaWindow.Mode != mode {
-			continue
-		}
-		next := append([]account.RoutingAccountBase(nil), snapshot.values...)
-		window := *next[index].QuotaWindow
-		window.Remaining = max(0, window.Remaining-amount)
-		window.UpdatedAt = time.Now().UTC()
-		next[index].QuotaWindow = &window
-		snapshot.values = next
-		s.routingBases[key] = snapshot
 	}
+	s.quotaMu.Unlock()
+}
+
+func (s *Selector) clearQuotaConsumptionAccount(provider account.Provider, accountID uint64) {
+	s.quotaMu.Lock()
+	for key := range s.quotaConsumed {
+		if key.provider == provider && key.accountID == accountID {
+			delete(s.quotaConsumed, key)
+		}
+	}
+	s.quotaMu.Unlock()
 }
 
 func (s *Selector) MarkFailure(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) {
@@ -1152,12 +1031,8 @@ func (s *Selector) markFailure(ctx context.Context, credential account.Credentia
 		}
 	}
 	until := time.Now().UTC().Add(cooldown)
-	// Persist health first. UpdateHealth notifies on failure (with AccountID when known); that
-	// may already patch L1 via the invalidation observer. Always re-apply with the known
-	// provider so cooldown is visible even without an observer and when the notify omits Provider.
-	// softNetwork 路径用 effectiveFailureCount，避免把瞬时网络抖动累进指数冷却。
 	healthErr := s.accounts.UpdateHealth(ctx, credential.ID, effectiveFailureCount, &until, fmt.Sprintf("upstream status %d", status), false)
-	s.invalidateAccount(credential.Provider, credential.ID)
+	s.invalidateCandidates(credential.Provider)
 	if status == 401 || status == 402 || status == 403 || status == 429 {
 		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	}
@@ -1173,41 +1048,47 @@ func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider
 
 func (s *Selector) loadCombinedCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string, now time.Time) ([]account.RoutingCandidate, error) {
 	key := candidateCacheKey{provider: provider, modelRouteID: modelRouteID, upstreamModel: upstreamModel, quotaMode: quotaMode}
-	baseGen := s.routingBaseVersion(provider)
-	overlayGen := s.routingOverlayVersion(provider)
 	s.candidateMu.Lock()
-	if snapshot, ok := s.candidates[key]; ok && s.candidateSnapshotFreshLocked(snapshot, baseGen, overlayGen, now) {
-		values := snapshot.values
+	if snapshot, ok := s.candidates[key]; ok && now.Before(snapshot.expiresAt) {
+		snapshot.lastAccess = now
+		s.candidates[key] = snapshot
 		s.candidateMu.Unlock()
-		s.cacheStats.assembledHits.Add(1)
-		return values, nil
+		return snapshot.values, nil
 	}
 	s.candidateMu.Unlock()
-	s.cacheStats.assembledMisses.Add(1)
 	loadKey := fmt.Sprintf("%s\x00%d\x00%s\x00%s", provider, modelRouteID, upstreamModel, quotaMode)
 	loaded, err, _ := s.candidateLoads.Do(loadKey, func() (any, error) {
 		checkTime := time.Now().UTC()
-		checkBase := s.routingBaseVersion(provider)
-		checkOverlay := s.routingOverlayVersion(provider)
+		var stale candidateSnapshot
+		hasStale := false
 		s.candidateMu.Lock()
-		if snapshot, ok := s.candidates[key]; ok && s.candidateSnapshotFreshLocked(snapshot, checkBase, checkOverlay, checkTime) {
-			values := snapshot.values
-			s.candidateMu.Unlock()
-			s.cacheStats.assembledHits.Add(1)
-			return values, nil
+		if snapshot, ok := s.candidates[key]; ok {
+			if checkTime.Before(snapshot.expiresAt) {
+				snapshot.lastAccess = checkTime
+				s.candidates[key] = snapshot
+				s.candidateMu.Unlock()
+				return snapshot.values, nil
+			}
+			if checkTime.Before(snapshot.staleUntil) {
+				stale, hasStale = snapshot, true
+			}
 		}
 		s.candidateMu.Unlock()
-		s.cacheStats.assembledLoads.Add(1)
 		values, err := s.accounts.ListRoutingCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode)
 		if err != nil {
+			if hasStale && canUseStaleRoutingSnapshot(ctx, err) {
+				s.candidateMu.Lock()
+				stale.lastAccess = checkTime
+				stale.expiresAt = staleRetryExpiry(checkTime, stale.staleUntil)
+				s.storeCandidateSnapshotLocked(key, stale, checkTime)
+				s.candidateMu.Unlock()
+				s.logStaleRoutingFallback("combined", provider, checkTime, stale.staleUntil, err)
+				return stale.values, nil
+			}
 			return nil, err
 		}
 		s.candidateMu.Lock()
-		currentBase := s.routingBaseVersionLocked(provider)
-		currentOverlay := s.routingOverlayVersionLocked(provider)
-		if currentBase == checkBase && currentOverlay == checkOverlay {
-			s.candidates[key] = newCandidateSnapshot(values, checkBase, checkOverlay, checkTime)
-		}
+		s.storeCandidateSnapshotLocked(key, newCandidateSnapshot(values, checkTime.Add(candidateCacheTTL)), checkTime)
 		s.candidateMu.Unlock()
 		return values, nil
 	})
@@ -1219,28 +1100,23 @@ func (s *Selector) loadCombinedCandidates(ctx context.Context, provider account.
 
 func (s *Selector) loadLayeredCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string, now time.Time) ([]account.RoutingCandidate, error) {
 	key := candidateCacheKey{provider: provider, modelRouteID: modelRouteID, upstreamModel: upstreamModel, quotaMode: quotaMode}
-	baseGen := s.routingBaseVersion(provider)
-	overlayGen := s.routingOverlayVersion(provider)
 	s.candidateMu.Lock()
-	if snapshot, ok := s.candidates[key]; ok && s.candidateSnapshotFreshLocked(snapshot, baseGen, overlayGen, now) {
-		values := snapshot.values
+	if snapshot, ok := s.candidates[key]; ok && now.Before(snapshot.expiresAt) {
+		snapshot.lastAccess = now
+		s.candidates[key] = snapshot
 		s.candidateMu.Unlock()
-		s.cacheStats.assembledHits.Add(1)
-		return values, nil
+		return snapshot.values, nil
 	}
 	s.candidateMu.Unlock()
-	s.cacheStats.assembledMisses.Add(1)
 	loadKey := fmt.Sprintf("assembled\x00%s\x00%d\x00%s\x00%s", provider, modelRouteID, upstreamModel, quotaMode)
 	loaded, err, _ := s.candidateLoads.Do(loadKey, func() (any, error) {
 		checkTime := time.Now().UTC()
 		s.candidateMu.Lock()
-		checkBase := s.routingBaseVersionLocked(provider)
-		checkOverlay := s.routingOverlayVersionLocked(provider)
-		if snapshot, ok := s.candidates[key]; ok && s.candidateSnapshotFreshLocked(snapshot, checkBase, checkOverlay, checkTime) {
-			values := snapshot.values
+		if snapshot, ok := s.candidates[key]; ok && checkTime.Before(snapshot.expiresAt) {
+			snapshot.lastAccess = checkTime
+			s.candidates[key] = snapshot
 			s.candidateMu.Unlock()
-			s.cacheStats.assembledHits.Add(1)
-			return values, nil
+			return snapshot.values, nil
 		}
 		s.candidateMu.Unlock()
 		layered := s.accounts.(repository.RoutingLayerRepository)
@@ -1257,13 +1133,11 @@ func (s *Selector) loadLayeredCandidates(ctx context.Context, provider account.P
 				checkTime = time.Now().UTC()
 				continue
 			}
-			// Assemble purely from in-memory L1/L2 snapshots when both layers are warm.
-			values := assembleRoutingCandidates(provider, bases, overlay)
-			s.cacheStats.assembledLoads.Add(1)
+			values := assembleRoutingCandidates(provider, quotaMode, bases, overlay)
 			s.candidateMu.Lock()
 			stable := baseVersion == s.routingBaseVersionLocked(provider) && overlayVersion == s.routingOverlayVersionLocked(provider)
 			if stable {
-				s.candidates[key] = newCandidateSnapshot(values, baseVersion, overlayVersion, checkTime)
+				s.storeCandidateSnapshotLocked(key, newCandidateSnapshot(values, checkTime.Add(candidateCacheTTL)), checkTime)
 			}
 			s.candidateMu.Unlock()
 			if stable {
@@ -1273,7 +1147,6 @@ func (s *Selector) loadLayeredCandidates(ctx context.Context, provider account.P
 		}
 		// Sustained account synchronization must not turn cache churn into user-facing
 		// failures. Fall back to the established authoritative combined query.
-		s.cacheStats.assembledLoads.Add(1)
 		return s.accounts.ListRoutingCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode)
 	})
 	if err != nil {
@@ -1286,43 +1159,60 @@ func (s *Selector) loadRoutingBases(ctx context.Context, layered repository.Rout
 	key := routingBaseCacheKey{provider: provider, quotaMode: quotaMode}
 	version := s.routingBaseVersion(provider)
 	s.candidateMu.Lock()
-	if snapshot, ok := s.routingBases[key]; ok && s.baseSnapshotFreshLocked(snapshot, version, now) {
+	if snapshot, ok := s.routingBases[key]; ok && now.Before(snapshot.expiresAt) && snapshot.version == version {
+		snapshot.lastAccess = now
+		s.routingBases[key] = snapshot
 		values := snapshot.values
 		s.candidateMu.Unlock()
-		s.cacheStats.baseHits.Add(1)
 		return values, version, nil
 	}
 	s.candidateMu.Unlock()
-	s.cacheStats.baseMisses.Add(1)
 	loadKey := "base\x00" + string(provider) + "\x00" + quotaMode
 	loaded, err, _ := s.candidateLoads.Do(loadKey, func() (any, error) {
 		checkTime := time.Now().UTC()
 		checkVersion := s.routingBaseVersion(provider)
+		var stale routingBaseSnapshot
+		hasStale := false
 		s.candidateMu.Lock()
-		if snapshot, ok := s.routingBases[key]; ok && s.baseSnapshotFreshLocked(snapshot, checkVersion, checkTime) {
-			values := snapshot.values
-			s.candidateMu.Unlock()
-			s.cacheStats.baseHits.Add(1)
-			return routingBaseLoadResult{values: values, version: checkVersion}, nil
+		if snapshot, ok := s.routingBases[key]; ok && snapshot.version == checkVersion {
+			if checkTime.Before(snapshot.expiresAt) {
+				snapshot.lastAccess = checkTime
+				s.routingBases[key] = snapshot
+				values := snapshot.values
+				s.candidateMu.Unlock()
+				return routingBaseLoadResult{values: values, version: checkVersion}, nil
+			}
+			if checkTime.Before(snapshot.staleUntil) {
+				stale, hasStale = snapshot, true
+			}
 		}
 		s.candidateMu.Unlock()
-		s.cacheStats.baseLoads.Add(1)
 		values, loadErr := layered.ListRoutingAccountBases(ctx, provider, quotaMode)
 		if loadErr != nil {
+			if hasStale && canUseStaleRoutingSnapshot(ctx, loadErr) {
+				s.candidateMu.Lock()
+				stale.lastAccess = checkTime
+				stale.expiresAt = staleRetryExpiry(checkTime, stale.staleUntil)
+				s.storeRoutingBaseSnapshotLocked(key, stale, checkTime)
+				s.candidateMu.Unlock()
+				s.logStaleRoutingFallback("base", provider, checkTime, stale.staleUntil, loadErr)
+				return routingBaseLoadResult{values: stale.values, version: checkVersion}, nil
+			}
 			return nil, loadErr
 		}
 		s.candidateMu.Lock()
 		currentVersion := s.routingBaseVersionLocked(provider)
 		if currentVersion == checkVersion {
-			s.routingBases[key] = routingBaseSnapshot{values: values, version: checkVersion, loadedAt: checkTime}
-		for accountID, cachedProvider := range s.routingAccountProvider {
-			if cachedProvider == provider {
-				delete(s.routingAccountProvider, accountID)
+			s.clearQuotaConsumption(provider)
+			s.storeRoutingBaseSnapshotLocked(key, routingBaseSnapshot{values: values, version: checkVersion, expiresAt: checkTime.Add(candidateCacheTTL)}, checkTime)
+			for accountID, cachedProvider := range s.routingAccountProvider {
+				if cachedProvider == provider {
+					delete(s.routingAccountProvider, accountID)
+				}
 			}
-		}
-		for _, value := range values {
-			s.routingAccountProvider[value.Credential.ID] = provider
-		}
+			for _, value := range values {
+				s.routingAccountProvider[value.Credential.ID] = provider
+			}
 		}
 		s.candidateMu.Unlock()
 		return routingBaseLoadResult{values: values, version: checkVersion}, nil
@@ -1338,35 +1228,51 @@ func (s *Selector) loadRoutingOverlay(ctx context.Context, layered repository.Ro
 	key := routingOverlayCacheKey{provider: provider, modelRouteID: modelRouteID, upstreamModel: upstreamModel}
 	version := s.routingOverlayVersion(provider)
 	s.candidateMu.Lock()
-	if snapshot, ok := s.routingOverlays[key]; ok && s.overlaySnapshotFreshLocked(snapshot, version, now) {
+	if snapshot, ok := s.routingOverlays[key]; ok && now.Before(snapshot.expiresAt) && snapshot.version == version {
+		snapshot.lastAccess = now
+		s.routingOverlays[key] = snapshot
 		value := snapshot.value
 		s.candidateMu.Unlock()
-		s.cacheStats.overlayHits.Add(1)
 		return value, version, nil
 	}
 	s.candidateMu.Unlock()
-	s.cacheStats.overlayMisses.Add(1)
 	loadKey := fmt.Sprintf("overlay\x00%s\x00%d\x00%s", provider, modelRouteID, upstreamModel)
 	loaded, err, _ := s.candidateLoads.Do(loadKey, func() (any, error) {
 		checkTime := time.Now().UTC()
 		checkVersion := s.routingOverlayVersion(provider)
+		var stale routingOverlaySnapshot
+		hasStale := false
 		s.candidateMu.Lock()
-		if snapshot, ok := s.routingOverlays[key]; ok && s.overlaySnapshotFreshLocked(snapshot, checkVersion, checkTime) {
-			value := snapshot.value
-			s.candidateMu.Unlock()
-			s.cacheStats.overlayHits.Add(1)
-			return routingOverlayLoadResult{value: value, version: checkVersion}, nil
+		if snapshot, ok := s.routingOverlays[key]; ok && snapshot.version == checkVersion {
+			if checkTime.Before(snapshot.expiresAt) {
+				snapshot.lastAccess = checkTime
+				s.routingOverlays[key] = snapshot
+				value := snapshot.value
+				s.candidateMu.Unlock()
+				return routingOverlayLoadResult{value: value, version: checkVersion}, nil
+			}
+			if checkTime.Before(snapshot.staleUntil) {
+				stale, hasStale = snapshot, true
+			}
 		}
 		s.candidateMu.Unlock()
-		s.cacheStats.overlayLoads.Add(1)
 		value, loadErr := layered.ListRoutingAccountOverlays(ctx, provider, modelRouteID, upstreamModel)
 		if loadErr != nil {
+			if hasStale && canUseStaleRoutingSnapshot(ctx, loadErr) {
+				s.candidateMu.Lock()
+				stale.lastAccess = checkTime
+				stale.expiresAt = staleRetryExpiry(checkTime, stale.staleUntil)
+				s.storeRoutingOverlaySnapshotLocked(key, stale, checkTime)
+				s.candidateMu.Unlock()
+				s.logStaleRoutingFallback("overlay", provider, checkTime, stale.staleUntil, loadErr)
+				return routingOverlayLoadResult{value: stale.value, version: checkVersion}, nil
+			}
 			return nil, loadErr
 		}
 		s.candidateMu.Lock()
 		currentVersion := s.routingOverlayVersionLocked(provider)
 		if currentVersion == checkVersion {
-			s.routingOverlays[key] = routingOverlaySnapshot{value: value, version: checkVersion, loadedAt: checkTime}
+			s.storeRoutingOverlaySnapshotLocked(key, routingOverlaySnapshot{value: value, version: checkVersion, expiresAt: checkTime.Add(candidateCacheTTL)}, checkTime)
 		}
 		s.candidateMu.Unlock()
 		return routingOverlayLoadResult{value: value, version: checkVersion}, nil
@@ -1376,36 +1282,6 @@ func (s *Selector) loadRoutingOverlay(ctx context.Context, layered repository.Ro
 	}
 	result := loaded.(routingOverlayLoadResult)
 	return result.value, result.version, nil
-}
-
-func (s *Selector) candidateSnapshotFreshLocked(snapshot candidateSnapshot, baseGen, overlayGen routingLayerVersion, now time.Time) bool {
-	if snapshot.baseGen != baseGen || snapshot.overlayGen != overlayGen {
-		return false
-	}
-	if candidateCacheSoftTTL > 0 && !snapshot.loadedAt.IsZero() && now.Sub(snapshot.loadedAt) > candidateCacheSoftTTL {
-		return false
-	}
-	return true
-}
-
-func (s *Selector) baseSnapshotFreshLocked(snapshot routingBaseSnapshot, version routingLayerVersion, now time.Time) bool {
-	if snapshot.version != version {
-		return false
-	}
-	if candidateCacheSoftTTL > 0 && !snapshot.loadedAt.IsZero() && now.Sub(snapshot.loadedAt) > candidateCacheSoftTTL {
-		return false
-	}
-	return true
-}
-
-func (s *Selector) overlaySnapshotFreshLocked(snapshot routingOverlaySnapshot, version routingLayerVersion, now time.Time) bool {
-	if snapshot.version != version {
-		return false
-	}
-	if candidateCacheSoftTTL > 0 && !snapshot.loadedAt.IsZero() && now.Sub(snapshot.loadedAt) > candidateCacheSoftTTL {
-		return false
-	}
-	return true
 }
 
 func (s *Selector) routingBaseVersion(provider account.Provider) routingLayerVersion {
@@ -1435,526 +1311,54 @@ func (s *Selector) routingVersionsStable(provider account.Provider, base, overla
 }
 
 // ApplyInvalidation advances local layer generations before any remote publish.
-// Token-only credential updates do not rebuild the routing base pool: selection
-// projections never carry encrypted tokens, and EnsureCredential reloads secrets via Get.
-// Single-account base events patch in-memory bases (or drop one account) without clearing
-// the whole provider pool; bulk events without AccountID still full-rebuild on next load.
-// Model×account overlay events patch one overlay row (+ matching L3) when possible.
 func (s *Selector) ApplyInvalidation(event repository.InvalidationEvent) {
 	if !event.Valid() {
-		return
-	}
-	// Token-only credential updates do not rebuild the routing base pool.
-	if event.Kind == repository.InvalidationAccountCredentialChanged {
-		s.cacheStats.tokenOnlySkipped.Add(1)
 		return
 	}
 	layer := event.Layer()
 	if layer != repository.InvalidationLayerRoute && layer != repository.InvalidationLayerBase && layer != repository.InvalidationLayerOverlay {
 		return
 	}
-	if event.Provider == "" && event.AccountID != 0 {
-		s.candidateMu.Lock()
-		if provider := s.routingAccountProvider[event.AccountID]; provider != "" {
-			event.Provider = provider
-		} else {
+	s.candidateMu.Lock()
+	provider := event.Provider
+	if provider == "" && event.AccountID != 0 {
+		provider = s.routingAccountProvider[event.AccountID]
+		if provider == "" {
 			for key, snapshot := range s.candidates {
 				if _, ok := snapshot.byAccount[event.AccountID]; ok {
-					event.Provider = key.provider
+					provider = key.provider
 					break
 				}
 			}
 		}
-		s.candidateMu.Unlock()
 	}
 	base := layer == repository.InvalidationLayerBase
 	overlay := layer == repository.InvalidationLayerOverlay || layer == repository.InvalidationLayerRoute
-
-	// Prefer row-level L1/L2 patches over full provider rebuild when AccountID is known.
-	if base && event.AccountID != 0 {
-		s.patchBaseAccount(event)
-		return
-	}
-	// Account-scoped overlay events (capability/model-quota/access-denied) patch that one
-	// account's overlay rows without clearing the whole provider. When UpstreamModel is known
-	// only that model is patched; otherwise the account is patched across every cached model
-	// for the provider (e.g. account capability sync replaces all its model rows).
-	if overlay && event.AccountID != 0 && layer == repository.InvalidationLayerOverlay {
-		s.patchOverlayAccount(event)
-		return
-	}
-
-	s.candidateMu.Lock()
-	defer s.candidateMu.Unlock()
 	if base {
-		s.cacheStats.baseEvents.Add(1)
-		s.cacheStats.bulkRebuilds.Add(1)
-		s.cacheStats.baseRebuilds.Add(1)
-		if event.Provider == "" {
+		s.clearQuotaConsumption(provider)
+		if provider == "" {
 			s.baseGlobalVersion++
 			clearRoutingBases(s.routingBases, "")
 		} else {
-			s.baseProviderVersion[event.Provider]++
-			clearRoutingBases(s.routingBases, event.Provider)
-		}
-		for key := range s.candidates {
-			if event.Provider == "" || key.provider == event.Provider {
-				delete(s.candidates, key)
-			}
+			s.baseProviderVersion[provider]++
+			clearRoutingBases(s.routingBases, provider)
 		}
 	}
 	if overlay {
-		s.cacheStats.overlayEvents.Add(1)
-		if event.Provider == "" {
+		if provider == "" {
 			s.overlayGlobalVersion++
 			clearRoutingOverlays(s.routingOverlays, "")
 		} else {
-			s.overlayProviderVersion[event.Provider]++
-			if event.UpstreamModel != "" {
-				clearRoutingOverlaysForModel(s.routingOverlays, event.Provider, event.UpstreamModel)
-			} else {
-				clearRoutingOverlays(s.routingOverlays, event.Provider)
-			}
-		}
-		for key := range s.candidates {
-			if event.Provider != "" && key.provider != event.Provider {
-				continue
-			}
-			if event.UpstreamModel != "" && key.upstreamModel != event.UpstreamModel {
-				continue
-			}
-			delete(s.candidates, key)
-		}
-	}
-}
-
-// patchBaseAccount updates warm L1 base snapshots for one account without clearing the pool.
-// Point-loads run outside the cache lock when RoutingAccountLookup is available.
-//
-// Fail-open rules (do not stamp a truncated pool as fresh for soft TTL):
-//   - missing RoutingAccountLookup → bulk clear provider bases
-//   - GetRoutingAccountBase timeout/error (except ErrNotFound) → bulk clear
-//   - ErrNotFound / disabled / non-active → remove that account only
-func (s *Selector) patchBaseAccount(event repository.InvalidationEvent) {
-	s.cacheStats.baseEvents.Add(1)
-	provider := event.Provider
-	accountID := event.AccountID
-
-	type modeKey struct {
-		provider  account.Provider
-		quotaMode string
-	}
-	s.candidateMu.Lock()
-	modes := make([]modeKey, 0, 4)
-	seen := make(map[modeKey]struct{})
-	for key := range s.routingBases {
-		if provider != "" && key.provider != provider {
-			continue
-		}
-		mk := modeKey{provider: key.provider, quotaMode: key.quotaMode}
-		if _, ok := seen[mk]; ok {
-			continue
-		}
-		seen[mk] = struct{}{}
-		modes = append(modes, mk)
-	}
-	s.candidateMu.Unlock()
-
-	lookup, hasLookup := s.accounts.(repository.RoutingAccountLookup)
-	if !hasLookup {
-		// No point API: match pre-Phase-1 safety — clear warm bases so next load full-lists.
-		s.bulkRebuildBase(provider)
-		return
-	}
-
-	// Cold L1: nothing to patch; bump generation and drop assembled so the next load full-lists.
-	if len(modes) == 0 {
-		s.bulkRebuildBase(provider)
-		// bulkRebuildBase already counts rebuild; avoid double-counting baseEvents-only path noise.
-		return
-	}
-
-	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), routingBasePointLoadTimeout)
-	defer cancel()
-
-	replacements := make(map[modeKey]*account.RoutingAccountBase, len(modes))
-	for _, mk := range modes {
-		base, err := lookup.GetRoutingAccountBase(loadCtx, accountID, mk.quotaMode)
-		if err != nil {
-			if errors.Is(err, repository.ErrNotFound) {
-				replacements[mk] = nil // definitive removal
-				continue
-			}
-			// Transient DB error or timeout: fail open to full provider rebuild.
-			s.bulkRebuildBase(provider)
-			return
-		}
-		if provider == "" {
-			provider = base.Credential.Provider
-		}
-		if !base.Credential.Enabled || base.Credential.AuthStatus != account.AuthStatusActive {
-			replacements[mk] = nil
-			continue
-		}
-		copyBase := base
-		replacements[mk] = &copyBase
-	}
-
-	s.candidateMu.Lock()
-	defer s.candidateMu.Unlock()
-	if provider != "" {
-		s.baseProviderVersion[provider]++
-	} else {
-		s.baseGlobalVersion++
-	}
-
-	changed := false
-	for key, snap := range s.routingBases {
-		if provider != "" && key.provider != provider {
-			continue
-		}
-		mk := modeKey{provider: key.provider, quotaMode: key.quotaMode}
-		nextBase, haveReplacement := replacements[mk]
-		if !haveReplacement {
-			// Mode disappeared between collect and apply; leave this snapshot alone.
-			continue
-		}
-		values := make([]account.RoutingAccountBase, 0, len(snap.values))
-		found := false
-		for _, base := range snap.values {
-			if base.Credential.ID != accountID {
-				values = append(values, base)
-				continue
-			}
-			found = true
-			if nextBase != nil {
-				values = append(values, *nextBase)
-			}
-		}
-		if !found && nextBase != nil {
-			values = append(values, *nextBase)
-			found = true
-		}
-		if !found && nextBase == nil {
-			// Account was not in this snapshot and should stay absent.
-			continue
-		}
-		snap.values = values
-		snap.loadedAt = time.Now().UTC()
-		snap.version = s.routingBaseVersionLocked(key.provider)
-		s.routingBases[key] = snap
-		changed = true
-	}
-	if changed {
-		s.cacheStats.basePatches.Add(1)
-	}
-	// Patch L3 rows in place instead of deleting every assembled entry for the provider.
-	// Prefer the replacement base from any mode key (same credential state across modes).
-	var replacement *account.RoutingAccountBase
-	for _, next := range replacements {
-		if next != nil {
-			replacement = next
-			break
-		}
-	}
-	// If every mode said remove (nil), drop the account from L3.
-	drop := true
-	for _, next := range replacements {
-		if next != nil {
-			drop = false
-			break
-		}
-	}
-	// L3 snapshots must adopt the just-bumped base version so they stay fresh;
-	// otherwise the version check would treat every patched snapshot as stale.
-	nextBaseGen := s.routingBaseVersionLocked(provider)
-	if drop {
-		if patchAssembledAccountLocked(s.candidates, provider, accountID, nil, nextBaseGen, routingLayerVersion{}) {
-			s.cacheStats.assembledPatches.Add(1)
-		}
-		return
-	}
-	if patchAssembledAccountLocked(s.candidates, provider, accountID, replacement, nextBaseGen, routingLayerVersion{}) {
-		s.cacheStats.assembledPatches.Add(1)
-	}
-}
-
-// patchOverlayAccount updates one account's overlay rows without clearing whole
-// model/provider snapshots when warm L2/L3 entries exist. When UpstreamModel is known
-// only that model is patched; when it is empty (e.g. account capability sync) the account
-// is patched across every cached model for the provider.
-func (s *Selector) patchOverlayAccount(event repository.InvalidationEvent) {
-	s.cacheStats.overlayEvents.Add(1)
-	provider := event.Provider
-	accountID := event.AccountID
-	upstreamModel := event.UpstreamModel
-
-	lookup, hasLookup := s.accounts.(repository.RoutingAccountLookup)
-	if !hasLookup {
-		s.bulkClearOverlayModel(provider, upstreamModel)
-		return
-	}
-
-	s.candidateMu.Lock()
-	overlayKeys := make([]routingOverlayCacheKey, 0, 8)
-	for key := range s.routingOverlays {
-		if provider != "" && key.provider != provider {
-			continue
-		}
-		if upstreamModel != "" && key.upstreamModel != upstreamModel {
-			continue
-		}
-		overlayKeys = append(overlayKeys, key)
-	}
-	assembledKeys := make([]candidateCacheKey, 0, 8)
-	for key := range s.candidates {
-		if provider != "" && key.provider != provider {
-			continue
-		}
-		if upstreamModel != "" && key.upstreamModel != upstreamModel {
-			continue
-		}
-		assembledKeys = append(assembledKeys, key)
-	}
-	s.candidateMu.Unlock()
-
-	// Cold L2 and L3: bump overlay generation so the next load reloads from DB.
-	if len(overlayKeys) == 0 && len(assembledKeys) == 0 {
-		s.candidateMu.Lock()
-		if provider == "" {
-			s.overlayGlobalVersion++
-		} else {
 			s.overlayProviderVersion[provider]++
-		}
-		s.candidateMu.Unlock()
-		return
-	}
-
-	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), routingBasePointLoadTimeout)
-	defer cancel()
-
-	// Collect point-loaded overlay fields per cached key. Use the key's own upstream model
-	// so the no-model case still patches the right model row per snapshot.
-	type overlayPatch struct {
-		value account.RoutingAccountOverlay
-		drop  bool
-	}
-	overlayPatches := make(map[routingOverlayCacheKey]overlayPatch, len(overlayKeys))
-	for _, key := range overlayKeys {
-		candidate, err := lookup.GetRoutingCandidate(loadCtx, accountID, key.modelRouteID, key.upstreamModel, "")
-		if err != nil {
-			if errors.Is(err, repository.ErrNotFound) {
-				overlayPatches[key] = overlayPatch{drop: true}
-				continue
-			}
-			s.bulkClearOverlayModel(provider, upstreamModel)
-			return
-		}
-		overlayPatches[key] = overlayPatch{value: account.RoutingAccountOverlay{
-			AccountID: accountID, Bound: snapHasBindings(s.routingOverlays, key), ModelCapabilityKnown: candidate.ModelCapabilityKnown,
-			SupportsModel: candidate.SupportsModel, ModelQuotaBlock: candidate.ModelQuotaBlock,
-		}}
-	}
-
-	assembledPatches := make(map[candidateCacheKey]*account.RoutingCandidate, len(assembledKeys))
-	for _, key := range assembledKeys {
-		candidate, err := lookup.GetRoutingCandidate(loadCtx, accountID, key.modelRouteID, key.upstreamModel, key.quotaMode)
-		if err != nil {
-			if errors.Is(err, repository.ErrNotFound) {
-				assembledPatches[key] = nil
-				continue
-			}
-			s.bulkClearOverlayModel(provider, upstreamModel)
-			return
-		}
-		copyCandidate := candidate
-		assembledPatches[key] = &copyCandidate
-	}
-
-	s.candidateMu.Lock()
-	defer s.candidateMu.Unlock()
-	// Do not bump overlay generation: in-place patch keeps warm snapshots valid.
-	changedOverlay := false
-	for key, patch := range overlayPatches {
-		snap, ok := s.routingOverlays[key]
-		if !ok {
-			continue
-		}
-		values := make([]account.RoutingAccountOverlay, 0, len(snap.value.Values))
-		found := false
-		for _, row := range snap.value.Values {
-			if row.AccountID != accountID {
-				values = append(values, row)
-				continue
-			}
-			found = true
-			if !patch.drop {
-				values = append(values, patch.value)
-			}
-		}
-		if !found && !patch.drop {
-			values = append(values, patch.value)
-			found = true
-		}
-		if !found && patch.drop {
-			continue
-		}
-		snap.value.Values = values
-		snap.loadedAt = time.Now().UTC()
-		s.routingOverlays[key] = snap
-		changedOverlay = true
-	}
-	if changedOverlay {
-		s.cacheStats.overlayPatches.Add(1)
-	}
-
-	changedAssembled := false
-	for key, next := range assembledPatches {
-		snap, ok := s.candidates[key]
-		if !ok {
-			continue
-		}
-		if next == nil {
-			if dropAssembledAccountInSnapshot(&snap, accountID) {
-				s.candidates[key] = snap
-				changedAssembled = true
-			}
-			continue
-		}
-		if upsertAssembledAccountInSnapshot(&snap, *next) {
-			s.candidates[key] = snap
-			changedAssembled = true
-		}
-	}
-	if changedAssembled {
-		s.cacheStats.assembledPatches.Add(1)
-	}
-}
-
-// snapHasBindings reports whether a warm overlay snapshot was loaded under model bindings.
-func snapHasBindings(overlays map[routingOverlayCacheKey]routingOverlaySnapshot, key routingOverlayCacheKey) bool {
-	if snap, ok := overlays[key]; ok {
-		return snap.value.HasBindings
-	}
-	return false
-}
-
-// bulkClearOverlayModel clears warm L2/L3 for a model (fail-open / no lookup).
-func (s *Selector) bulkClearOverlayModel(provider account.Provider, upstreamModel string) {
-	s.candidateMu.Lock()
-	defer s.candidateMu.Unlock()
-	if provider == "" {
-		s.overlayGlobalVersion++
-		clearRoutingOverlays(s.routingOverlays, "")
-	} else {
-		s.overlayProviderVersion[provider]++
-		if upstreamModel != "" {
-			clearRoutingOverlaysForModel(s.routingOverlays, provider, upstreamModel)
-		} else {
 			clearRoutingOverlays(s.routingOverlays, provider)
 		}
-	}
-	for key := range s.candidates {
-		if provider != "" && key.provider != provider {
-			continue
-		}
-		if upstreamModel != "" && key.upstreamModel != upstreamModel {
-			continue
-		}
-		delete(s.candidates, key)
-	}
-}
-
-// patchAssembledAccountLocked updates or drops one account in warm L3 snapshots.
-// caller must hold candidateMu. nextBase nil means drop. Overlay fields are preserved
-// when updating from a base replacement. baseGen/overlayGen, when non-zero, are adopted
-// by patched snapshots so the next freshness check passes without a reload.
-func patchAssembledAccountLocked(candidates map[candidateCacheKey]candidateSnapshot, provider account.Provider, accountID uint64, nextBase *account.RoutingAccountBase, baseGen, overlayGen routingLayerVersion) bool {
-	changed := false
-	now := time.Now().UTC()
-	for key, snap := range candidates {
-		if provider != "" && key.provider != provider {
-			continue
-		}
-		if nextBase == nil {
-			if dropAssembledAccountInSnapshot(&snap, accountID) {
-				// Drop keeps overlayGen; refresh baseGen so the shrunk snapshot stays valid.
-				if baseGen != (routingLayerVersion{}) {
-					snap.baseGen = baseGen
-				}
-				snap.loadedAt = now
-				candidates[key] = snap
-				changed = true
-			}
-			continue
-		}
-		index, found := snap.byAccount[accountID]
-		if !found || index >= len(snap.values) {
-			// Account not in this model assembled list — leave alone (may be unbound).
-			continue
-		}
-		next := append([]account.RoutingCandidate(nil), snap.values...)
-		candidate := next[index]
-		candidate.Credential = nextBase.Credential
-		candidate.Billing = nextBase.Billing
-		candidate.QuotaWindow = nextBase.QuotaWindow
-		candidate.QuotaRecovery = nextBase.QuotaRecovery
-		next[index] = candidate
-		snap.values = next
-		if baseGen != (routingLayerVersion{}) {
-			snap.baseGen = baseGen
-		}
-		snap.loadedAt = now
-		// byAccount indexes unchanged
-		candidates[key] = snap
-		changed = true
-	}
-	return changed
-}
-
-func dropAssembledAccountInSnapshot(snap *candidateSnapshot, accountID uint64) bool {
-	index, found := snap.byAccount[accountID]
-	if !found || index >= len(snap.values) {
-		return false
-	}
-	next := make([]account.RoutingCandidate, 0, len(snap.values)-1)
-	next = append(next, snap.values[:index]...)
-	next = append(next, snap.values[index+1:]...)
-	*snap = newCandidateSnapshot(next, snap.baseGen, snap.overlayGen, snap.loadedAt)
-	return true
-}
-
-func upsertAssembledAccountInSnapshot(snap *candidateSnapshot, candidate account.RoutingCandidate) bool {
-	index, found := snap.byAccount[candidate.Credential.ID]
-	if found && index < len(snap.values) {
-		next := append([]account.RoutingCandidate(nil), snap.values...)
-		next[index] = candidate
-		snap.values = next
-		return true
-	}
-	next := append(append([]account.RoutingCandidate(nil), snap.values...), candidate)
-	*snap = newCandidateSnapshot(next, snap.baseGen, snap.overlayGen, time.Now().UTC())
-	return true
-}
-
-// bulkRebuildBase clears warm L1 bases (and assembled) for a provider so the next load full-lists.
-func (s *Selector) bulkRebuildBase(provider account.Provider) {
-	s.candidateMu.Lock()
-	defer s.candidateMu.Unlock()
-	s.cacheStats.bulkRebuilds.Add(1)
-	s.cacheStats.baseRebuilds.Add(1)
-	if provider == "" {
-		s.baseGlobalVersion++
-		clearRoutingBases(s.routingBases, "")
-	} else {
-		s.baseProviderVersion[provider]++
-		clearRoutingBases(s.routingBases, provider)
 	}
 	for key := range s.candidates {
 		if provider == "" || key.provider == provider {
 			delete(s.candidates, key)
 		}
 	}
+	s.candidateMu.Unlock()
 }
 
 func clearRoutingBases(values map[routingBaseCacheKey]routingBaseSnapshot, provider account.Provider) {
@@ -1973,12 +1377,167 @@ func clearRoutingOverlays(values map[routingOverlayCacheKey]routingOverlaySnapsh
 	}
 }
 
-func clearRoutingOverlaysForModel(values map[routingOverlayCacheKey]routingOverlaySnapshot, provider account.Provider, upstreamModel string) {
-	for key := range values {
-		if (provider == "" || key.provider == provider) && key.upstreamModel == upstreamModel {
+func cacheSnapshotAccess(lastAccess, expiresAt time.Time) time.Time {
+	if !lastAccess.IsZero() {
+		return lastAccess
+	}
+	return expiresAt
+}
+
+func staleRetryExpiry(now, staleUntil time.Time) time.Time {
+	expiresAt := now.Add(candidateCacheRetryTTL)
+	if !staleUntil.IsZero() && expiresAt.After(staleUntil) {
+		return staleUntil
+	}
+	return expiresAt
+}
+
+// canUseStaleRoutingSnapshot deliberately accepts only errors that carry a
+// transient signal. Serving stale data for cancellations, schema/query bugs,
+// or repository validation failures would hide correctness problems.
+func canUseStaleRoutingSnapshot(ctx context.Context, err error) bool {
+	if err == nil || ctx != nil && ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, repository.ErrNotFound) || errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrLimitExceeded) || errors.Is(err, repository.ErrInvalidRecord) || errors.Is(err, repository.ErrAccountPoolMismatch) {
+		return false
+	}
+	if errors.Is(err, sql.ErrConnDone) || errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
+		return true
+	}
+	var temporary interface{ Temporary() bool }
+	if errors.As(err, &temporary) && temporary.Temporary() {
+		return true
+	}
+	// modernc SQLite exposes the primary/extended result through Code().
+	// SQLITE_BUSY (5) and SQLITE_LOCKED (6) are safe to retry.
+	var sqliteError interface{ Code() int }
+	if errors.As(err, &sqliteError) {
+		switch sqliteError.Code() & 0xff {
+		case 5, 6:
+			return true
+		}
+	}
+	// pgx exposes SQLSTATE without requiring the application layer to depend on
+	// a concrete PostgreSQL driver type.
+	var postgresError interface{ SQLState() string }
+	if errors.As(err, &postgresError) {
+		switch state := postgresError.SQLState(); {
+		case strings.HasPrefix(state, "08"), strings.HasPrefix(state, "40"), state == "55P03", state == "57P01", state == "57P02", state == "57P03":
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Selector) logStaleRoutingFallback(layer string, provider account.Provider, now, staleUntil time.Time, err error) {
+	key := layer + "\x00" + string(provider)
+	s.staleLogMu.Lock()
+	if s.staleFallbackLoggedAt == nil {
+		s.staleFallbackLoggedAt = make(map[string]time.Time)
+	}
+	last := s.staleFallbackLoggedAt[key]
+	if !last.IsZero() && now.Sub(last) < candidateCacheStaleLogInterval {
+		s.staleLogMu.Unlock()
+		return
+	}
+	s.staleFallbackLoggedAt[key] = now
+	s.staleLogMu.Unlock()
+
+	staleFor := now.Sub(staleUntil.Add(-candidateCacheStaleTTL))
+	if staleFor < 0 {
+		staleFor = 0
+	}
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn("routing_snapshot_stale_fallback",
+		"provider", provider,
+		"layer", layer,
+		"stale_for_ms", staleFor.Milliseconds(),
+		"retry_after_ms", candidateCacheRetryTTL.Milliseconds(),
+		"error_type", fmt.Sprintf("%T", err),
+	)
+}
+
+type snapshotCacheMetadata struct {
+	values     int
+	staleUntil time.Time
+	accessedAt time.Time
+}
+
+func pruneSnapshotCache[K comparable, V any](values map[K]V, protected K, now time.Time, maxSnapshots, maxValues int, metadata func(V) snapshotCacheMetadata) {
+	for key, value := range values {
+		entry := metadata(value)
+		if key != protected && !entry.staleUntil.IsZero() && !now.Before(entry.staleUntil) {
 			delete(values, key)
 		}
 	}
+	for {
+		total := 0
+		for _, value := range values {
+			total += metadata(value).values
+		}
+		// A single oversized provider pool must remain usable. The budget becomes
+		// a strict bound as soon as there is another evictable snapshot.
+		if len(values) <= maxSnapshots && (total <= maxValues || len(values) == 1) {
+			return
+		}
+		var oldestKey K
+		var oldestAt time.Time
+		found := false
+		for key, value := range values {
+			if key == protected {
+				continue
+			}
+			accessedAt := metadata(value).accessedAt
+			if !found || accessedAt.Before(oldestAt) {
+				oldestKey, oldestAt, found = key, accessedAt, true
+			}
+		}
+		if !found {
+			return
+		}
+		delete(values, oldestKey)
+	}
+}
+
+func (s *Selector) storeCandidateSnapshotLocked(key candidateCacheKey, snapshot candidateSnapshot, now time.Time) {
+	snapshot.lastAccess = now
+	if snapshot.staleUntil.IsZero() {
+		snapshot.staleUntil = snapshot.expiresAt.Add(candidateCacheStaleTTL)
+	}
+	s.candidates[key] = snapshot
+	pruneSnapshotCache(s.candidates, key, now, maxCandidateCacheSnapshots, maxCandidateCacheValues, func(value candidateSnapshot) snapshotCacheMetadata {
+		return snapshotCacheMetadata{values: len(value.values), staleUntil: value.staleUntil, accessedAt: cacheSnapshotAccess(value.lastAccess, value.expiresAt)}
+	})
+}
+
+func (s *Selector) storeRoutingBaseSnapshotLocked(key routingBaseCacheKey, snapshot routingBaseSnapshot, now time.Time) {
+	snapshot.lastAccess = now
+	if snapshot.staleUntil.IsZero() {
+		snapshot.staleUntil = snapshot.expiresAt.Add(candidateCacheStaleTTL)
+	}
+	s.routingBases[key] = snapshot
+	pruneSnapshotCache(s.routingBases, key, now, maxRoutingBaseSnapshots, maxRoutingBaseValues, func(value routingBaseSnapshot) snapshotCacheMetadata {
+		return snapshotCacheMetadata{values: len(value.values), staleUntil: value.staleUntil, accessedAt: cacheSnapshotAccess(value.lastAccess, value.expiresAt)}
+	})
+}
+
+func (s *Selector) storeRoutingOverlaySnapshotLocked(key routingOverlayCacheKey, snapshot routingOverlaySnapshot, now time.Time) {
+	snapshot.lastAccess = now
+	if snapshot.staleUntil.IsZero() {
+		snapshot.staleUntil = snapshot.expiresAt.Add(candidateCacheStaleTTL)
+	}
+	s.routingOverlays[key] = snapshot
+	pruneSnapshotCache(s.routingOverlays, key, now, maxRoutingOverlaySnapshots, maxRoutingOverlayValues, func(value routingOverlaySnapshot) snapshotCacheMetadata {
+		return snapshotCacheMetadata{values: len(value.value.Values), staleUntil: value.staleUntil, accessedAt: cacheSnapshotAccess(value.lastAccess, value.expiresAt)}
+	})
 }
 
 type routingBaseLoadResult struct {
@@ -1991,7 +1550,7 @@ type routingOverlayLoadResult struct {
 	version routingLayerVersion
 }
 
-func assembleRoutingCandidates(provider account.Provider, bases []account.RoutingAccountBase, overlay account.RoutingOverlaySnapshot) []account.RoutingCandidate {
+func assembleRoutingCandidates(provider account.Provider, quotaMode string, bases []account.RoutingAccountBase, overlay account.RoutingOverlaySnapshot) []account.RoutingCandidate {
 	byAccount := make(map[uint64]account.RoutingAccountOverlay, len(overlay.Values))
 	for _, value := range overlay.Values {
 		byAccount[value.AccountID] = value
@@ -2007,13 +1566,16 @@ func assembleRoutingCandidates(provider account.Provider, bases []account.Routin
 		}
 	}
 	result := make([]account.RoutingCandidate, 0, len(bases))
+	staticConsoleModel := provider == account.ProviderConsole && strings.TrimSpace(quotaMode) != ""
 	for _, base := range bases {
 		overlayValue := byAccount[base.Credential.ID]
 		if overlay.HasBindings && !overlayValue.Bound {
 			continue
 		}
 		known, supports := overlayValue.ModelCapabilityKnown, overlayValue.SupportsModel
-		if overlay.HasBindings {
+		if staticConsoleModel {
+			known, supports = true, true
+		} else if overlay.HasBindings {
 			known, supports = true, true
 		} else if sharedSuperBuildModel && account.IsBuildSuper(base.Credential, base.Billing) {
 			known, supports = true, true
@@ -2029,17 +1591,6 @@ func assembleRoutingCandidates(provider account.Provider, bases []account.Routin
 func (s *Selector) invalidateCandidates(provider account.Provider) {
 	s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: provider})
 	s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountCapabilityChanged, Provider: provider})
-}
-
-// invalidateAccount 走 fork 的账号级 layered invalidation，避免单号变化清空整个 Provider。
-func (s *Selector) invalidateAccount(provider account.Provider, accountID uint64) {
-	if accountID == 0 {
-		s.invalidateCandidates(provider)
-		return
-	}
-	s.ApplyInvalidation(repository.InvalidationEvent{
-		Kind: repository.InvalidationAccountStateChanged, Provider: provider, AccountID: accountID,
-	})
 }
 
 // evictCandidate 从当前进程的候选快照中移除一个账号。持久化状态仍由调用方先写入；
